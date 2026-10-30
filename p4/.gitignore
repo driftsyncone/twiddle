@@ -1,0 +1,27 @@
+# Build output and generated files
+build/
+dist/
+managed_components/
+sdkconfig
+sdkconfig.old
+sdkconfig.*
+!sdkconfig.defaults
+compile_commands.json
+.cache/
+
+# Secrets: never commit (copy main/secrets.example.h to main/secrets.h)
+main/secrets.h
+*.secret
+.env
+
+# Local scratch and tooling
+main/local_stubs.cpp
+main/zz_screenshot_dump.cpp
+.cl[a]ude/   # agent worktrees
+*.log
+*.pyc
+__pycache__/
+.vscode/
+.idea/
+.DS_Store
+*~
