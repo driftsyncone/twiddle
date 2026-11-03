@@ -19,10 +19,10 @@ Guition's own variant naming: `JC1060P470C_I_W` (original and V2) and `JC1060P47
 
 | `panel` | Name | How to recognise it |
 |---|---|---|
-| **0** | V2 (default) | rear label shows **V2** after the material number; the first 7" unit we tested |
+| **0** | V2 (default) | rear label shows **V2** after the material number; the first 7" unit we tested. Also verified on two `JC1060P470C_I_W_Y` units (1024x600, normal colours) |
 | **1** | original | older batch; the V2 table on it is washed out and shifts. Not seen on hardware here; values from ESPHome |
-| **4** | **`_Y` new panel** | model `JC1060P470C_I_W_Y`, in a plastic shell with no rear label (unit "P4 #2"). The screen stays **black with a faint white glow at the edges** with the V2 settings |
-| 2, 3 | test combinations | table and reset pin crossed; they gave nothing on the `_Y` unit; kept for experiments |
+| **4** | **`_Y` new panel** (alternative RGB565 table) | model `JC1060P470C_I_W_Y`. An earlier test unit stayed black with a faint white glow with V2 settings; on a fresh/erased unit the V2 default has since driven two `_I_W_Y` units correctly, so try 0 first and 4 only if the screen stays black or the colours are wrong. Other batches may differ. The Display select flow (trial, Keep, revert) is untested on hardware |
+| 2, 3 | test combinations | table and reset pin crossed; they gave nothing on the early `_Y` unit; kept for experiments |
 
 `panel 4` differs from V2 in exactly two ways (found from Guition's `JC1060P470C_I_W_Y_New_Panel` Arduino demo and
 verified on hardware): LCD reset on **GPIO5** and **16-bit RGB565** pixels, with the panel told so by COLMOD `0x3A = 0x55`
@@ -30,6 +30,14 @@ placed *before* sleep-out in the init table (the driver never sets COLMOD itself
 pixel clock default is **48 MHz** (the picture shakes at 52). LVGL runs RGB565 on that variant and `/screenshot` converts
 it to the same 24-bit BMP. Do **not** read a DCS register back (`esp_lcd_panel_io_rx_param`) on this panel: the read blanks it.
 The `_Y` demo drives the touch without the reset/interrupt pins; the GT911 works here with both (verified by tapping).
+
+**Choosing the variant without a working screen:** on a fresh image join the `Twiddle-Setup` Wi-Fi from a phone, open
+`http://192.168.4.1/setup` and use **My screen looks wrong** (a select with the variants above). The panel restarts with the
+choice **on trial**: a **Keep** banner appears at the bottom of its screen, and only a tap on it makes the choice permanent.
+If the screen stays black nobody can tap, so after 3 unconfirmed boots the next boot goes back to the last confirmed variant
+(the pixel clock override is cleared too) and the panel says so once on its screen. Boot counting is in `panelfb.h`
+(NVS `panel`, `pprev`, `ptrial`, `pboots`). The firmware never reads the display controller's ID registers to guess the
+variant: a DCS read blanks the `_Y` panel. The same select is on the LAN `/setup` page (behind the web login) and as `GET /panel?v=N`.
 
 If a unit stays black: set `panel` 0, 4, 1 in turn (`curl -u ota:PW "http://<ip>/panel?v=4"`, then `POST /restart`); a black
 screen with the backlight glowing and `GET /screenshot` showing the UI means the panel setup, not the firmware.
@@ -44,6 +52,19 @@ screen with the backlight glowing and `GET /screenshot` showing the UI means the
 The V2 column is what `board_dsi_init.c` sets (checked). The original-panel column and the 750 Mbps lane rate come from
 ESPHome's `mipi_dsi` models (`JC1060P470` and `JC1060P470-V2`) and are not in this repo's code (not verified here); RGB
 element order is set in `board_dsi_init.c`. The DSI PHY is powered from LDO channel 3 at 2.5 V (checked).
+
+## Chip revision
+The boot log prints `chip: ESP32-P4 rev vX.Y` and `GET /` has the same `chip:` line; anything but **v1.3 (the only
+revision tested)** adds a warning. The image is built with ESP-IDF 5.5.1 for revisions **v0.1 to v1.99**
+(`CONFIG_ESP32P4_REV_MIN_FULL=1`, `CONFIG_ESP32P4_REV_MAX_FULL=199`). Research for a v3.0 chip (2026 silicon, "changes power rails"):
+- `ESP32P4_REV_MAX_FULL` is a hidden Kconfig symbol in IDF 5.5.1 ("can not be changed by user, only Espressif can change it when a new version is supported in IDF"), so it cannot be raised from `sdkconfig.defaults`.
+- The check is in the ROM-started second-stage bootloader (`bootloader_common_check_chip_revision_validity`): an app image whose
+  max revision (v1.99) is below the chip's is refused with `chip revision check failed. Required <= v1.99, found v3.0.`, unless the
+  eFuse `disable_wafer_version_major` is burnt (irreversible, not an option). So a v3.0 board would not boot this image at all.
+  The warning above therefore only helps for revisions that boot (v1.0, v1.1 ...), not for v3.0.
+- The fix is a newer ESP-IDF that supports v3.x (it also carries the chip fixes), a rebuild and a hardware test on a v3.0 unit.
+  Nothing was changed here: lowering the minimum or editing the maximum without that would only trade a clear bootloader error for undefined behaviour.
+  The web flasher page says "tested on chip revision v1.3 only".
 
 ## Pin map
 | Function | Pins |

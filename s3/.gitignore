@@ -1,2 +1,5 @@
 .pio/
 include/secrets.h
+dist/
+lgpl-package/
+compile_commands.json

@@ -18,6 +18,11 @@
 #include "board.h"
 #include "control.h"
 #include "devices.h"
+#include "apwindow.h"
+#include "devrow.h"
+#include "hrm.h"
+#include "otapw.h"
+#include "panelfb.h"
 #include "settings.h"
 #include "theme.h"
 #include "version.h"
@@ -42,13 +47,17 @@ static lv_obj_t *battLabel, *battBanner;
 static lv_obj_t *tabview;
 static lv_obj_t *rSlider, *rSliderLabel, *rStartBtn;
 static lv_obj_t *apStartBtn, *apStateLabel, *apChart, *apFavBtn[Settings::FAVOURITES], *apDrawBtn;
-static lv_chart_series_t *apPast, *apFuture;
+static lv_chart_series_t *apPast, *apFuture, *apHrSeries;
+static lv_obj_t *hrLiveLabel;  // Session tab: the live bpm
 static lv_chart_cursor_t *apCursor;
+static lv_obj_t *apLblL, *apLblNow, *apLblR, *apLblNote;  // axis labels and the HR note, inside the chart
+static int64_t apWinNow;  // session time (ms) at the window's "now" point (the Autopilot graph window)
+static bool apWinWhole;  // Draw is on: the chart shows the whole session instead of the window
 static const int AP_POINTS = 96;
 static const int ST_ROW = PY(48);  // Session/Settings rows: six have to fit above the fold
 static bool apDraw;  // Session tab's Draw: dragging on the graph sets a wave's peak
 static lv_obj_t *scButtons[SCRIPT_SLOTS], *scToggleBtn;
-static lv_obj_t *stSsid, *stPass, *stToken, *stScanBtn, *stSaveBtn, *stOffBtn, *stInfo;
+static lv_obj_t *stSsid, *stPass, *stToken, *stWebPw, *stScanBtn, *stSaveBtn, *stOffBtn, *stInfo;
 static lv_obj_t *dvScanBtn, *dvList;
 static const int DV_MAX = 10;  // devices shown; more than that won't be in one room
 static lv_obj_t *rWhatLabel;  // under the Remote slider: what it drives on the selected device
@@ -105,6 +114,7 @@ static void valveRow(lv_obj_t *r) {
 static int selectedIndex(const devices::Info *inf, int n) {
   int picked = -1, firstUp = -1;
   for (int i = 0; i < n; i++) {
+    if (inf[i].caps & devices::CAP_HR) continue;  // a heart rate monitor has no controls to show
     if (selPicked && picked < 0 && !strcmp(inf[i].addr, selAddr)) picked = i;
     if (firstUp < 0 && inf[i].connected) firstUp = i;
   }
@@ -269,7 +279,7 @@ static void buildTopBar(lv_obj_t *scr) {
     int cur = selectedIndex(inf, n);
     for (int k = 1; k < n; k++) {
       int i = (cur + k) % n;
-      if (inf[i].connected) return selectDevice(inf[i].addr);
+      if (inf[i].connected && !(inf[i].caps & devices::CAP_HR)) return selectDevice(inf[i].addr);
     }
     lv_tabview_set_active(tabview, 4, LV_ANIM_OFF);  // nothing else to switch to: Devices
   }, LV_EVENT_CLICKED, nullptr);
@@ -403,7 +413,9 @@ static void chartEvent(lv_event_t *e) {
   lv_event_code_t c = lv_event_get_code(e);
   uint32_t id = lv_chart_get_pressed_point(apChart);
   if (id == LV_CHART_POINT_NONE || !control::autopilotSessionMs()) return;
-  uint32_t t = (uint64_t)id * control::autopilotSessionMs() / AP_POINTS;
+  // Whole session while drawing; otherwise the window: the tapped x is a time around "now".
+  uint32_t t = apWinWhole ? (uint32_t)((uint64_t)id * control::autopilotSessionMs() / AP_POINTS)
+                          : apwin::clampMs(apwin::timeAt((int)id, AP_POINTS, apWinNow), control::autopilotSessionMs());
   if (c == LV_EVENT_PRESSING && apDraw) {
     // Drag: the finger's height sets the peak of the wave under it.
     lv_point_t pt;
@@ -445,7 +457,26 @@ static void buildAutopilot(lv_obj_t *tab) {
   lv_obj_set_style_pad_all(apChart, PY(6), 0);
   apPast = lv_chart_add_series(apChart, themed(Role::ChartPast), LV_CHART_AXIS_PRIMARY_Y);
   apFuture = lv_chart_add_series(apChart, themed(Role::ChartFuture), LV_CHART_AXIS_PRIMARY_Y);
+  // HR edging: the heart rate over the session, scaled 40..220 bpm onto the 0..100 axis.
+  apHrSeries = lv_chart_add_series(apChart, themed(Role::Stop), LV_CHART_AXIS_PRIMARY_Y);
   apCursor = lv_chart_add_cursor(apChart, themed(Role::Pause), LV_DIR_VER);
+  // Axis in seconds relative to now (the window is the last 10 s and the next 30 s), written by refresh().
+  auto axisLabel = [](const char *text, lv_align_t al) {
+    lv_obj_t *l = lv_label_create(apChart);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_18, 0);
+    theme::bind(l, Prop::Text, Role::TextDim);
+    lv_label_set_text(l, text);
+    lv_obj_set_clickable(l, false);
+    lv_obj_set_align(l, al);
+    return l;
+  };
+  apLblL = axisLabel("", LV_ALIGN_BOTTOM_LEFT);
+  apLblNow = axisLabel("now", LV_ALIGN_BOTTOM_LEFT);
+  lv_obj_set_x(apLblNow, lv_pct(25));
+  lv_obj_set_style_translate_x(apLblNow, lv_pct(-50), 0);
+  apLblR = axisLabel("", LV_ALIGN_BOTTOM_RIGHT);
+  apLblNote = axisLabel("HR-driven: depends on heart rate", LV_ALIGN_TOP_RIGHT);
+  lv_obj_set_hidden(apLblNote, true);
   lv_obj_add_event_cb(apChart, chartEvent, LV_EVENT_PRESSING, nullptr);
   lv_obj_add_event_cb(apChart, chartEvent, LV_EVENT_SHORT_CLICKED, nullptr);
 
@@ -487,47 +518,147 @@ static void favEvent(lv_event_t *e) {
   }
 }
 
+// ---- HR edging settings (Session tab, below the plain Autopilot rows) ----
+// A row per number: [-] value [+]. Every change is saved at once and handed to the running session.
+
+struct Stepper {
+  lv_obj_t *val;
+  int *v;
+  int lo, hi, step;
+  const char *unit;
+  int zeroBelow;  // values below this read "off" (0 = never)
+  const char *zeroText;
+};
+static Stepper steppers[6];
+static int nSteppers;
+
+static void stepperShow(const Stepper &s) {
+  char t[24];
+  if (*s.v < s.zeroBelow) snprintf(t, sizeof t, "%s", s.zeroText);
+  else snprintf(t, sizeof t, "%d%s%s", *s.v, *s.unit ? " " : "", s.unit);
+  setLabel(s.val, t);
+}
+
+static void stepperShowAll() {
+  for (int i = 0; i < nSteppers; i++) stepperShow(steppers[i]);
+}
+
+static void stepperEvent(lv_event_t *e) {
+  intptr_t k = (intptr_t)lv_event_get_user_data(e);
+  Stepper &s = steppers[k >> 1];
+  int v = constrain(*s.v + ((k & 1) ? s.step : -s.step), s.lo, s.hi);
+  if (v == *s.v) return;
+  *s.v = v;
+  // The edge has to stay above resting.
+  settings.hrEdge = constrain(settings.hrEdge, settings.hrResting + 10, 200);
+  settingsSaveHr();
+  control::autopilotHrApply();
+  stepperShowAll();
+}
+
+static lv_obj_t *stepperRow(lv_obj_t *tab, const char *title, int *v, int lo, int hi, int step, const char *unit,
+                            int zeroBelow = 0, const char *zeroText = "off") {
+  lv_obj_t *r = row(tab, ST_ROW);
+  lv_obj_t *l = lv_label_create(r);
+  lv_label_set_text(l, title);
+  lv_obj_set_width(l, PX(190));
+  Stepper &s = steppers[nSteppers];
+  s = {nullptr, v, lo, hi, step, unit, zeroBelow, zeroText};
+  button(r, LV_SYMBOL_MINUS, PX(80), ST_ROW, Role::Neutral, stepperEvent, (void *)(intptr_t)(nSteppers * 2));
+  s.val = lv_label_create(r);
+  lv_obj_set_width(s.val, PX(150));
+  lv_obj_set_style_text_align(s.val, LV_TEXT_ALIGN_CENTER, 0);
+  button(r, LV_SYMBOL_PLUS, PX(80), ST_ROW, Role::Neutral, stepperEvent, (void *)(intptr_t)(nSteppers * 2 + 1));
+  stepperShow(s);
+  nSteppers++;
+  return r;
+}
+
+static lv_obj_t *hrBox, *hrMoreBtn;
+
+static void hrMoreEvent(lv_event_t *) {
+  bool show = lv_obj_has_flag(hrBox, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_set_flag(hrBox, LV_OBJ_FLAG_HIDDEN, !show);
+  lv_label_set_text(lv_obj_get_child(hrMoreBtn, 0), show ? LV_SYMBOL_UP : LV_SYMBOL_DOWN);
+}
+
+static void hrToggle(int i) { control::autopilotSetHrEdging(i == 1); }
+
+// One row on the Session tab (switch + a button that opens the numbers). The numbers sit in a box that is
+// collapsed by default, so the tab does not need to scroll (a scroll repaints the whole tab).
+static void buildHrSection(lv_obj_t *tab, int h) {
+  static const char *onOff[] = {"Off", "On", ""};
+  lv_obj_t *seg = labeledSeg(tab, "HR edging", onOff, control::autopilotHrEdging(), hrToggle, h);
+  hrMoreBtn = button(lv_obj_get_parent(seg), LV_SYMBOL_DOWN, PX(80), h, Role::Neutral, hrMoreEvent);
+  hrBox = lv_obj_create(tab);
+  lv_obj_remove_style_all(hrBox);
+  lv_obj_set_size(hrBox, lv_pct(100), LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(hrBox, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_row(hrBox, PY(6), 0);
+  lv_obj_add_flag(hrBox, LV_OBJ_FLAG_HIDDEN);
+  hrLiveLabel = lv_label_create(hrBox);
+  lv_obj_set_width(hrLiveLabel, lv_pct(100));
+  lv_obj_set_style_text_font(hrLiveLabel, &lv_font_montserrat_18, 0);
+  theme::bind(hrLiveLabel, Prop::Text, Role::TextDim);
+  lv_label_set_text(hrLiveLabel, "");
+  nSteppers = 0;
+  stepperRow(hrBox, "Resting bpm", &settings.hrResting, 40, 150, 1, "bpm");
+  lv_obj_t *er = stepperRow(hrBox, "Edge bpm", &settings.hrEdge, 50, 200, 1, "bpm");
+  lv_obj_t *learn = button(er, "Learn", PX(150), ST_ROW, Role::Accent, [](lv_event_t *) {
+    control::autopilotHrLearnEdge();  // from the current reading; ignored without one
+    stepperShowAll();
+  });
+  lv_obj_set_style_text_font(lv_obj_get_child(learn, 0), &lv_font_montserrat_24, 0);
+  stepperRow(hrBox, "Recovery drop", &settings.hrDrop, 3, 60, 1, "bpm");
+  stepperRow(hrBox, "Edges", &settings.hrEdges, 0, 50, 1, "", 1, "no limit");
+  stepperRow(hrBox, "Raise per edge", &settings.hrStep, 0, 10, 1, "bpm", 1, "none");
+  stepperRow(hrBox, "Fast rise", &settings.hrRise, 0, 60, 4, "bpm / 10 s", 8, "off");
+}
+
 static void buildSession(lv_obj_t *tab) {
   lv_obj_set_flex_flow(tab, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_style_pad_row(tab, PY(6), 0);
+  lv_obj_set_style_pad_row(tab, PY(4), 0);
+  const int SR = PY(42);  // seven rows (with HR edging) have to fit above the fold: no scrolling by default
 
   static const char *intensity[] = {"Warmup", "Low", "Medium", "High", ""};
   static const char *edge[] = {"Gentle", "Moderate", "Intense", ""};
   static const char *vac[] = {"Off", "Low", "High", ""};
   static const char *length[] = {"Auto", "5 min", "10 min", "20 min", "30 min", ""};
   static const char *surprise[] = {"Rising", "Shuffled", "Wild", ""};
-  labeledSeg(tab, "Intensity", intensity, control::autopilotIntensity(), control::autopilotSetIntensity, ST_ROW);
-  labeledSeg(tab, "Edge", edge, control::autopilotEdge(), control::autopilotSetEdge, ST_ROW);
+  labeledSeg(tab, "Intensity", intensity, control::autopilotIntensity(), control::autopilotSetIntensity, SR);
+  labeledSeg(tab, "Edge", edge, control::autopilotEdge(), control::autopilotSetEdge, SR);
   valveRow(lv_obj_get_parent(
-      labeledSeg(tab, "Vacuum", vac, control::autopilotVacuum(), control::autopilotSetVacuum, ST_ROW)));
-  labeledSeg(tab, "Length", length, control::autopilotLength(), control::autopilotSetLength, ST_ROW);
-  labeledSeg(tab, "Peaks", surprise, control::autopilotSurprise(), control::autopilotSetSurprise, ST_ROW);
+      labeledSeg(tab, "Vacuum", vac, control::autopilotVacuum(), control::autopilotSetVacuum, SR)));
+  labeledSeg(tab, "Length", length, control::autopilotLength(), control::autopilotSetLength, SR);
+  labeledSeg(tab, "Peaks", surprise, control::autopilotSurprise(), control::autopilotSetSurprise, SR);
 
   // Favourites (tap: load, hold: save), Draw (drag peaks on the graph), Reset.
-  lv_obj_t *r = row(tab, ST_ROW);
+  lv_obj_t *r = row(tab, SR);
   lv_obj_t *l = lv_label_create(r);
   lv_label_set_text(l, "Favourites");
   lv_obj_set_width(l, PX(130));
   for (int i = 0; i < Settings::FAVOURITES; i++) {
-    apFavBtn[i] = button(r, "", PX(90), ST_ROW, Role::Neutral, nullptr);
+    apFavBtn[i] = button(r, "", PX(90), SR, Role::Neutral, nullptr);
     lv_obj_add_event_cb(apFavBtn[i], favEvent, LV_EVENT_SHORT_CLICKED, (void *)(intptr_t)i);
     lv_obj_add_event_cb(apFavBtn[i], favEvent, LV_EVENT_LONG_PRESSED, (void *)(intptr_t)i);
     lv_obj_set_style_text_font(lv_obj_get_child(apFavBtn[i], 0), &lv_font_montserrat_24, 0);
     favLabel(i);
   }
-  apDrawBtn = button(r, LV_SYMBOL_EDIT " Draw", 0, ST_ROW, Role::Neutral, [](lv_event_t *) {
+  apDrawBtn = button(r, LV_SYMBOL_EDIT " Draw", 0, SR, Role::Neutral, [](lv_event_t *) {
     apDraw = !apDraw;
     lv_obj_set_state(apDrawBtn, LV_STATE_CHECKED, apDraw);
   });
   lv_obj_set_flex_grow(apDrawBtn, 1);
   theme::bind(apDrawBtn, Prop::Bg, Role::Primary, LV_STATE_CHECKED);
   lv_obj_set_style_text_font(lv_obj_get_child(apDrawBtn, 0), &lv_font_montserrat_24, 0);
-  lv_obj_t *reset = button(r, "Reset", PX(110), ST_ROW, Role::Neutral, [](lv_event_t *) {
+  lv_obj_t *reset = button(r, "Reset", PX(110), SR, Role::Neutral, [](lv_event_t *) {
     control::autopilotClearPeaks();
     apDraw = false;
     lv_obj_set_state(apDrawBtn, LV_STATE_CHECKED, false);
   });
   lv_obj_set_style_text_font(lv_obj_get_child(reset, 0), &lv_font_montserrat_24, 0);
+
+  buildHrSection(tab, SR);
 }
 
 // ---------- scripts tab ----------
@@ -598,11 +729,11 @@ static void buildScripts(lv_obj_t *tab) {
 static const int DV_ROW = PY(72);
 
 struct DevRow {
-  lv_obj_t *card, *dot, *name, *status, *follow, *scale, *btn;  // btn: nullptr for the cloud device
+  lv_obj_t *card, *dot, *name, *status, *follow, *scale, *btn, *btn2;  // btn Connect, btn2 Forget: nullptr for the cloud device
   char addr[18];   // which device the row was built for (indexes move on a scan)
   int8_t dotState;  // 0 grey, 1 orange, 2 green; -1 not set yet
   int8_t scaleSel;
-  int8_t known;
+  int16_t layoutKey;  // devrow::Layout last applied (-1: none yet)
   int8_t selected;  // highlighted as the selected device
   bool wasMoving;  // moving when last reachable: for the lost banner
 };
@@ -634,23 +765,28 @@ static void devScaleEvent(lv_event_t *e) {
   devices::setScale(i, SCALES[sel]);
 }
 
+// Connect: also for a remembered device that dropped out (it stays remembered; the retry backoff restarts).
 static void devButtonEvent(lv_event_t *e) {
   int i = (intptr_t)lv_event_get_user_data(e);
   devices::Info d;
+  if (devAt(i, d) && !d.connected && !d.connecting) devices::connect(i);
+}
+
+static void devForgetEvent(lv_event_t *e) {
+  int i = (intptr_t)lv_event_get_user_data(e);
+  devices::Info d;
   if (!devAt(i, d)) return;
-  if (d.known) {
-    devices::forget(i);
-    dvSig = 0;  // the list may shrink: rebuild at the next refresh
-  } else {
-    devices::connect(i);
-  }
+  devices::forget(i);
+  dvSig = 0;  // the list may shrink: rebuild at the next refresh
 }
 
 // Tap on a row (outside its switch, scale and button): show that device's controls.
 static void devRowEvent(lv_event_t *e) {
   int i = (intptr_t)lv_event_get_user_data(e);
   devices::Info d;
-  if (devAt(i, d)) selectDevice(d.addr);
+  // A heart rate monitor is an input: it has no controls to show.
+  if (devAt(i, d) && devrow::layout(d.addr[0], d.known, d.connected, d.connecting, d.caps & devices::CAP_HR).selectable)
+    selectDevice(d.addr);
 }
 
 static int scaleSel(int pct) { return constrain((pct + 12) / 25 - 1, 0, 3); }  // nearest of 25/50/75/100
@@ -668,7 +804,8 @@ static void devBuildRows(const devices::Info *inf, int n) {
     DevRow &r = dvRows[i];
     r = DevRow{};
     snprintf(r.addr, sizeof r.addr, "%s", d.addr);
-    r.dotState = r.scaleSel = r.known = r.selected = -1;
+    r.dotState = r.scaleSel = r.selected = -1;
+    r.layoutKey = -1;
     for (int j = 0; j < oldShown; j++)
       if (!strcmp(old[j].addr, d.addr)) r.wasMoving = old[j].wasMoving;
 
@@ -720,15 +857,18 @@ static void devBuildRows(const devices::Info *inf, int n) {
     lv_obj_set_size(r.scale, PX(250), PY(56));
     lv_obj_set_style_pad_all(r.scale, PY(4), 0);
     lv_obj_add_event_cb(r.scale, devScaleEvent, LV_EVENT_VALUE_CHANGED, (void *)(intptr_t)i);
+    // Follow / share / buttons are shown or hidden by devUpdateRow from the current state, every refresh.
 
     if (d.addr[0]) {
-      r.btn = button(card, "", PX(140), PY(56), Role::Primary, devButtonEvent, (void *)(intptr_t)i);
+      r.btn = button(card, "", PX(120), PY(56), Role::Primary, devButtonEvent, (void *)(intptr_t)i);
       lv_obj_set_style_text_font(lv_obj_get_child(r.btn, 0), &lv_font_montserrat_24, 0);
+      r.btn2 = button(card, "Forget", PX(100), PY(56), Role::Neutral2, devForgetEvent, (void *)(intptr_t)i);
+      lv_obj_set_style_text_font(lv_obj_get_child(r.btn2, 0), &lv_font_montserrat_24, 0);
     } else {
       lv_obj_t *gap = lv_obj_create(card);  // keeps the columns lined up
       lv_obj_remove_style_all(gap);
       lv_obj_set_clickable(gap, false);
-      lv_obj_set_size(gap, PX(140), 1);
+      lv_obj_set_size(gap, PX(228), 1);
     }
   }
 }
@@ -762,7 +902,11 @@ static void devUpdateRow(DevRow &r, const devices::Info &d, bool selected) {
   if (!d.addr[0] && !settings.token.length()) {
     snprintf(text, sizeof text, "Set the token in Settings");
   } else {
-    int at = snprintf(text, sizeof text, "%s", d.status);
+    // Bluetooth: say so when a link comes up (the driver reports "Ready").
+    int at = snprintf(text, sizeof text, "%s", d.addr[0] && d.connected && !strcmp(d.status, "Ready") ? "Connected" : d.status);
+    if ((d.caps & devices::CAP_HR) && d.connected && at < (int)sizeof text)
+      at += d.bpm ? snprintf(text + at, sizeof text - at, "  HR %d bpm (input only)", d.bpm)
+                  : snprintf(text + at, sizeof text - at, "  waiting for a reading (input only)");
     if (d.level > 0 && at < (int)sizeof text) at += snprintf(text + at, sizeof text - at, "  at %d%%", d.level);
     if (d.battery >= 0 && at < (int)sizeof text)
       at += snprintf(text + at, sizeof text - at, "  " LV_SYMBOL_BATTERY_FULL " %d%%", d.battery);
@@ -777,9 +921,23 @@ static void devUpdateRow(DevRow &r, const devices::Info &d, bool selected) {
     r.scaleSel = sel;
     lv_buttonmatrix_set_button_ctrl(r.scale, sel, LV_BUTTONMATRIX_CTRL_CHECKED);  // one_checked clears the rest
   }
-  if (r.btn && d.known != r.known) {
-    r.known = d.known;
-    setButtonText(r.btn, d.known ? "Forget" : "Connect", d.known ? Role::Neutral2 : Role::Primary);
+  // Which controls show comes from the current state every time (a monitor's kind can be known late).
+  devrow::Layout lay = devrow::layout(d.addr[0], d.known, d.connected, d.connecting, d.caps & devices::CAP_HR);
+  if (lay.key() != r.layoutKey) {
+    r.layoutKey = lay.key();
+    lv_obj_set_hidden(r.follow, !(lay.follow));
+    lv_obj_set_hidden(r.scale, !(lay.follow));
+    if (r.btn) {
+      lv_obj_set_hidden(r.btn, !(lay.primary != devrow::Primary::None));
+      lv_obj_set_hidden(r.btn2, !(lay.forget));
+      if (lay.primary == devrow::Primary::Connecting) {
+        lv_obj_set_state(r.btn, LV_STATE_DISABLED, true);
+        setButtonText(r.btn, "Connecting", Role::TextDim);
+      } else {
+        lv_obj_set_state(r.btn, LV_STATE_DISABLED, false);
+        setButtonText(r.btn, "Connect", Role::Primary);
+      }
+    }
   }
 }
 
@@ -803,7 +961,8 @@ static void buildDevices(lv_obj_t *tab) {
   lv_obj_set_flex_grow(hint, 1);
   lv_obj_set_style_text_font(hint, &lv_font_montserrat_18, 0);
   lv_label_set_text(hint, "Tap a device to show its controls. New toy: switch it on, Scan, Connect.\n"
-                          "Follow: it takes the panel's speed, at the % next to it.");
+                          "Follow: it takes the panel's speed, at the % next to it. A heart rate monitor is an input "
+                          "and takes no speed. 3 Bluetooth links in all.");
 
   dvList = lv_obj_create(tab);
   lv_obj_remove_style_all(dvList);
@@ -819,6 +978,9 @@ static void buildDevices(lv_obj_t *tab) {
 // The screen timeout applies at once.
 
 static String pSsid, pPass, pToken;  // pending, not saved yet
+
+static void wifiSetupShow();  // first-run Wi-Fi screen (below)
+static void pinSaveShow();    // the always-visible Save bar (below)
 
 static bool settingsDirty() {
   return pSsid != settings.wifiSsid || pPass != settings.wifiPass || pToken != settings.token;
@@ -839,11 +1001,20 @@ static void settingsShow() {
     tokenShown = pToken;
   }
   lv_label_set_text(lv_obj_get_child(stToken, 0), pToken.length() ? tokenShown.c_str() : "(none)");
+  // The web login (ota.sh, browser): shown in full on purpose, it is made for the person holding the panel.
+  if (stWebPw) {
+    char t[64];
+    if (!otapw::known()) snprintf(t, sizeof t, "none: web admin locked");
+    else snprintf(t, sizeof t, "ota / %s%s", otapw::get(), otapw::fixedByBuild() ? "  (set in the build)" : "");
+    lv_label_set_text(lv_obj_get_child(stWebPw, 0), t);
+  }
   // Nothing changed: the same button is a plain Restart.
   bool dirty = settingsDirty();
   if (!lv_obj_has_state(stSaveBtn, LV_STATE_DISABLED))
     setButtonText(stSaveBtn, dirty ? "Save & restart" : LV_SYMBOL_REFRESH " Restart",
                   dirty ? Role::Start : Role::Neutral2);
+  wifiSetupShow();
+  pinSaveShow();
 }
 
 static lv_obj_t *valueField(lv_obj_t *parent, const char *title, lv_event_cb_t cb) {
@@ -866,6 +1037,43 @@ static void editPass() {
     pPass = t;
     settingsShow();
   });
+}
+
+// Tap on the web login: "Reset the web password?" with Cancel / Reset. The old password stops working at once.
+static void webPwTap(lv_event_t *) {
+  if (otapw::fixedByBuild()) return;  // dev build: the password is in secrets.h
+  lv_obj_t *bg = lv_obj_create(lv_layer_top());
+  lv_obj_set_size(bg, SCREEN_W, SCREEN_H);
+  lv_obj_set_style_radius(bg, 0, 0);
+  lv_obj_set_style_border_width(bg, 0, 0);
+  theme::bind(bg, Prop::Bg, Role::Scrim);
+  lv_obj_set_style_bg_opa(bg, LV_OPA_70, 0);
+  lv_obj_set_scrollable(bg, false);
+
+  lv_obj_t *box = lv_obj_create(bg);
+  lv_obj_set_size(box, PX(760), LV_SIZE_CONTENT);
+  lv_obj_center(box);
+  lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_all(box, PY(24), 0);
+  lv_obj_set_style_pad_row(box, PY(20), 0);
+  lv_obj_set_scrollable(box, false);
+
+  lv_obj_t *t = lv_label_create(box);
+  lv_label_set_text(t, "Reset the web password?\nA new one is made and shown here. The old one stops\n"
+                       "working at once: ota.sh and any open browser login need the new one.");
+  lv_obj_set_width(t, lv_pct(100));
+
+  lv_obj_t *r = row(box, PY(64));
+  button(r, "Cancel", 0, PY(64), Role::TextDim, [](lv_event_t *e) {
+    lv_obj_delete_async((lv_obj_t *)lv_event_get_user_data(e));
+  }, bg);
+  lv_obj_set_flex_grow(lv_obj_get_child(r, 0), 1);
+  button(r, "Reset password", 0, PY(64), Role::Danger2, [](lv_event_t *e) {
+    otapw::reset();
+    settingsShow();
+    lv_obj_delete_async((lv_obj_t *)lv_event_get_user_data(e));
+  }, bg);
+  lv_obj_set_flex_grow(lv_obj_get_child(r, 1), 1);
 }
 
 static void networkChosen(lv_event_t *e) {
@@ -921,14 +1129,136 @@ static void showNetworks(int n) {
   }
 }
 
+// `btn` shows "..." while the scan runs (the Settings tab's and the first-run screen's Scan buttons both use this).
 static void scanPoll(lv_timer_t *t) {
   bool done = !wlan::scanRunning() && wlan::scanGeneration() != scanGen0;
   bool timedOut = millis() - scanT0 > SCAN_WAIT_MS;
   if (!done && !timedOut) return;
+  lv_obj_t *btn = (lv_obj_t *)lv_timer_get_user_data(t);
   lv_timer_delete(t);
   scanState = 0;
-  setButtonText(stScanBtn, "Scan", Role::Primary);
+  setButtonText(btn, "Scan", Role::Primary);
   showNetworks(done ? wlan::scanCount() : -1);  // n < 0: scan failed, shows "No networks found"
+}
+
+static void startScan(lv_obj_t *btn) {
+  if (scanState) return;
+  scanState = 1;
+  scanGen0 = wlan::scanGeneration();
+  scanT0 = millis();
+  wlan::scanStart();  // no-op if one is already running: its result is as good
+  setButtonText(btn, "...", Role::TextDim);
+  lv_timer_create(scanPoll, 300, btn);
+}
+
+// Save the pending Wi-Fi / token and restart (the Save & restart button, the pinned bar and the first-run screen).
+static void saveAndRestart() {
+  if (settingsDirty()) {
+    settings.wifiSsid = pSsid;
+    settings.wifiPass = pPass;
+    settings.token = pToken;
+    settingsSave();  // plain Restart writes nothing
+  }
+  control::stopAndRestart();
+}
+
+// ---------- first-run Wi-Fi screen ----------
+// Shown while no Wi-Fi is saved (the setup portal is up), or a saved network that does not join. Wi-Fi only: the Autoblow
+// token and Bluetooth toys are set up later on the Settings and Devices tabs. The phone page (http://192.168.4.1/setup)
+// stays as the fallback.
+
+static lv_obj_t *wsBg, *wsSsid, *wsPass, *wsSave, *wsScan;
+static bool wsDone;  // built once per boot (also after Skip)
+
+static void wifiSetupShow() {
+  if (!wsBg) return;
+  lv_label_set_text(lv_obj_get_child(wsSsid, 0), pSsid.length() ? pSsid.c_str() : "(tap to pick or type)");
+  lv_label_set_text(lv_obj_get_child(wsPass, 0),
+                    pPass.length() ? LV_SYMBOL_BULLET LV_SYMBOL_BULLET LV_SYMBOL_BULLET LV_SYMBOL_BULLET LV_SYMBOL_BULLET
+                                       LV_SYMBOL_BULLET
+                                   : "(none: open network)");
+  if (pSsid.length()) lv_obj_remove_state(wsSave, LV_STATE_DISABLED);
+  else lv_obj_add_state(wsSave, LV_STATE_DISABLED);
+}
+
+static void buildWifiSetup(const char *why) {
+  wsDone = true;
+  lv_obj_t *bg = wsBg = lv_obj_create(lv_layer_top());
+  lv_obj_set_size(bg, SCREEN_W, SCREEN_H);
+  lv_obj_set_style_radius(bg, 0, 0);
+  lv_obj_set_style_border_width(bg, 0, 0);
+  theme::bind(bg, Prop::Bg, Role::OverlayBg);
+  lv_obj_set_style_bg_opa(bg, LV_OPA_COVER, 0);
+  lv_obj_set_flex_flow(bg, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_all(bg, PX(20), 0);
+  lv_obj_set_style_pad_row(bg, PY(12), 0);
+  lv_obj_set_scrollable(bg, false);
+
+  lv_obj_t *t = lv_label_create(bg);
+  lv_label_set_text(t, why ? "Wi-Fi is not connecting" : "Connect to Wi-Fi");
+  lv_obj_set_style_text_font(t, &lv_font_montserrat_36, 0);
+  theme::bind(t, Prop::Text, Role::OverlayText);
+
+  if (why) {  // a saved network that fails: say why, the fields below are filled in for correcting
+    lv_obj_t *wl = lv_label_create(bg);
+    lv_label_set_text_fmt(wl, "Reason: %s. Check the name and password below.", why);
+    theme::bind(wl, Prop::Text, Role::OverlayText);
+  }
+  wsSsid = valueField(bg, "Network", [](lv_event_t *) {
+    editText("Wi-Fi network name", pSsid.c_str(), false, [](const char *s, intptr_t) {
+      pSsid = s;
+      pSsid.trim();
+      settingsShow();
+    });
+  });
+  wsScan = button(lv_obj_get_parent(wsSsid), "Scan", PX(140), ST_ROW, Role::Primary, [](lv_event_t *e) {
+    startScan(lv_event_get_target_obj(e));
+  });
+  lv_obj_set_style_text_font(lv_obj_get_child(wsScan, 0), &lv_font_montserrat_24, 0);
+  wsPass = valueField(bg, "Password", [](lv_event_t *) { editPass(); });
+
+  lv_obj_t *r = row(bg, PY(64));
+  wsSave = button(r, "Save & restart", PX(300), PY(60), Role::Start, [](lv_event_t *e) {
+    lv_obj_add_state(lv_event_get_target_obj(e), LV_STATE_DISABLED);
+    setButtonText(lv_event_get_target_obj(e), "Restarting...", Role::TextDim);
+    saveAndRestart();
+  });
+  theme::bind(wsSave, Prop::Bg, Role::Disabled, LV_STATE_DISABLED);
+  button(r, "Skip", PX(160), PY(60), Role::TextDim, [](lv_event_t *) {
+    lv_obj_delete_async(wsBg);
+    wsBg = nullptr;
+  });
+
+  lv_obj_t *hint = lv_label_create(bg);
+  lv_obj_set_width(hint, lv_pct(100));
+  lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_font(hint, &lv_font_montserrat_18, 0);
+  theme::bind(hint, Prop::Text, Role::TextDim);
+  lv_label_set_text(hint,
+                    "Tap Scan to pick your network, then enter its password. The Autoblow token and Bluetooth toys are set up "
+                    "later (Settings and Devices tabs).\n"
+                    "If this screen looks garbled, or you prefer a phone: join Wi-Fi Twiddle-Setup (password twiddle-setup) "
+                    "and open http://192.168.4.1/setup");
+  wifiSetupShow();
+}
+
+// ---------- Save bar ----------
+// Save & restart is at the bottom of a long Settings list: a bar stays in view while Wi-Fi or token have unsaved changes.
+
+static lv_obj_t *pinSave;
+
+static void pinSaveShow() {
+  bool dirty = settingsDirty() && !wsBg;
+  if (!pinSave) {
+    if (!dirty) return;
+    pinSave = button(lv_layer_top(), "Save & restart", PX(300), PY(64), Role::Start, [](lv_event_t *e) {
+      lv_obj_add_state(lv_event_get_target_obj(e), LV_STATE_DISABLED);
+      setButtonText(lv_event_get_target_obj(e), "Restarting...", Role::TextDim);
+      saveAndRestart();
+    });
+    lv_obj_align(pinSave, LV_ALIGN_BOTTOM_RIGHT, -PX(16), -PY(16));
+  }
+  lv_obj_set_flag(pinSave, LV_OBJ_FLAG_HIDDEN, !dirty);
 }
 
 // Software can't power the board off: the IP5306 charger has no data bus, and
@@ -984,14 +1314,8 @@ static void buildSettings(lv_obj_t *tab) {
       settingsShow();
     });
   });
-  stScanBtn = button(lv_obj_get_parent(stSsid), "Scan", PX(140), ST_ROW, Role::Primary, [](lv_event_t *) {
-    if (scanState) return;
-    scanState = 1;
-    scanGen0 = wlan::scanGeneration();
-    scanT0 = millis();
-    wlan::scanStart();  // no-op if one is already running: its result is as good
-    setButtonText(stScanBtn, "...", Role::TextDim);
-    lv_timer_create(scanPoll, 300, nullptr);
+  stScanBtn = button(lv_obj_get_parent(stSsid), "Scan", PX(140), ST_ROW, Role::Primary, [](lv_event_t *e) {
+    startScan(lv_event_get_target_obj(e));
   });
   lv_obj_set_style_text_font(lv_obj_get_child(stScanBtn, 0), &lv_font_montserrat_24, 0);
   stPass = valueField(tab, "Password", [](lv_event_t *) { editPass(); });
@@ -1002,6 +1326,8 @@ static void buildSettings(lv_obj_t *tab) {
       settingsShow();
     });
   });
+
+  stWebPw = valueField(tab, "Web login", webPwTap);
 
   static const char *sleep[] = {"Never", "1 min", "5 min", "15 min", ""};
   static const int SLEEP_MIN[] = {0, 1, 5, 15};
@@ -1091,16 +1417,10 @@ static void buildSettings(lv_obj_t *tab) {
   lv_obj_set_flex_grow(stInfo, 1);
   lv_obj_set_style_text_font(stInfo, &lv_font_montserrat_18, 0);
   stSaveBtn = button(r, "", PX(230), PY(60), Role::TextDim, [](lv_event_t *) {
-    if (settingsDirty()) {
-      settings.wifiSsid = pSsid;
-      settings.wifiPass = pPass;
-      settings.token = pToken;
-      settingsSave();  // plain Restart writes nothing
-    }
     lv_obj_add_state(stSaveBtn, LV_STATE_DISABLED);
     lv_obj_add_state(stOffBtn, LV_STATE_DISABLED);
     setButtonText(stSaveBtn, "Restarting...", Role::TextDim);
-    control::stopAndRestart();
+    saveAndRestart();
   });
   theme::bind(stSaveBtn, Prop::Bg, Role::Disabled, LV_STATE_DISABLED);
   stOffBtn = button(r, LV_SYMBOL_POWER " Power off", PX(200), PY(60), Role::Danger2, powerOffTap);
@@ -1122,10 +1442,14 @@ static const char *modeText(const char *m) {
 }
 
 static void refresh(lv_timer_t *) {
+  wlan::Info w = wlan::info();
+  // Wi-Fi starts after the UI is built: once it reports "no network saved", offer the first-run Wi-Fi screen ...
+  // ... or a saved network that has not joined 45 s after boot for a reason the user can fix (name, password).
+  if (!wsDone && wlan::portalActive()) buildWifiSetup(nullptr);
+  else if (!wsDone && !w.up && w.fixable && millis() > 45000 && w.problem[0]) buildWifiSetup(w.problem);
   autoblow::Status st = autoblow::status();
   Active a = control::active();
 
-  wlan::Info w = wlan::info();
   int bars = wlan::bars(w.rssi);
 
   // All devices once per refresh (row labels, status line, banner, speed).
@@ -1306,7 +1630,27 @@ static void refresh(lv_timer_t *) {
 
   // Autopilot
   uint32_t sess = control::autopilotSessionMs(), played = control::autopilotElapsedMs();
-  if (a == Active::Autopilot) {
+  bool hrMode = control::autopilotHrEdging();
+  control::HrStatus hr = control::autopilotHrStatus();
+  if (hrMode) {
+    static const char *PHASE[] = {"climbing", "EDGE, backing off", "resting", "signal lost, backing off", "done"};
+    char edges[24];
+    if (hr.maxEdges) snprintf(edges, sizeof edges, "%d/%d", hr.edges, hr.maxEdges);
+    else snprintf(edges, sizeof edges, "%d", hr.edges);
+    char bpmText[16];
+    if (hr.bpm) snprintf(bpmText, sizeof bpmText, "%d bpm", hr.bpm);
+    else snprintf(bpmText, sizeof bpmText, "no bpm");
+    if (a == Active::Autopilot)
+      snprintf(text, sizeof text, "%s  %d%%  %s\nedge at %d bpm, edges %s", bpmText, control::autopilotSpeed(),
+               PHASE[constrain(hr.phase, 0, 4)], hr.edgeBpm, edges);
+    else if (hr.end)
+      snprintf(text, sizeof text, "%s\n%s", hr.end == 1 ? "HR session done" : hr.end == 2 ? "HR session: time is up"
+               : "Stopped: heart rate signal lost", bpmText);
+    else
+      snprintf(text, sizeof text, "HR edging standby\n%s", hrm::connected() ? bpmText : "no monitor connected");
+    setButtonText(apStartBtn, a == Active::Autopilot ? LV_SYMBOL_PAUSE " Pause" : LV_SYMBOL_PLAY " Start",
+                  a == Active::Autopilot ? Role::Pause : Role::Start);
+  } else if (a == Active::Autopilot) {
     setButtonText(apStartBtn, LV_SYMBOL_PAUSE " Pause", Role::Pause);
     uint32_t peakIn = control::autopilotNextPeakMs() / 1000, left = (sess - min(played, sess)) / 1000;
     if (peakIn) snprintf(text, sizeof text, "%d%%  peak in %lu:%02lu\n%lu:%02lu left", control::autopilotSpeed(),
@@ -1320,22 +1664,103 @@ static void refresh(lv_timer_t *) {
   }
   setLabel(apStateLabel, text);
 
-  // The graph: redrawn only when the curve or the playhead moved.
-  static uint8_t curve[AP_POINTS];
-  static uint32_t lastHead = ~0u;
-  bool changed = false;
-  for (int i = 0; i < AP_POINTS; i++) {
-    uint8_t v = sess ? control::autopilotSpeedAt((uint64_t)i * sess / AP_POINTS) : 0;
-    if (v != curve[i]) { curve[i] = v; changed = true; }
-  }
-  uint32_t head = sess ? min<uint32_t>(AP_POINTS - 1, (uint64_t)played * AP_POINTS / sess) : 0;
-  if (changed || head != lastHead) {
-    lastHead = head;
-    for (int i = 0; i < AP_POINTS; i++) {
-      lv_chart_set_value_by_id(apChart, apPast, i, i <= (int)head ? curve[i] : LV_CHART_POINT_NONE);
-      lv_chart_set_value_by_id(apChart, apFuture, i, i >= (int)head ? curve[i] : LV_CHART_POINT_NONE);
+  if (hrMode) {
+    if (hrm::connected()) {
+      if (hr.bpm) snprintf(state, sizeof state, "%d bpm", hr.bpm);
+      else snprintf(state, sizeof state, "waiting for a reading");
+      snprintf(text, sizeof text, "Monitor connected: %s. Edge now at %d bpm.", state, hr.edgeBpm);
     }
-    lv_chart_set_cursor_point(apChart, apCursor, apFuture, head);
+    else snprintf(text, sizeof text, "No heart rate monitor connected: pair one on the Devices tab (it uses one of the 3 Bluetooth links).");
+  } else {
+    snprintf(text, sizeof text, "Off: Autopilot plays its planned waves. On: the heart rate decides when to edge; "
+             "Intensity and Length still apply.");
+  }
+  setLabel(hrLiveLabel, text);
+
+  // The graph: a moving window on the session (the last 10 s, the next 30 s, "now" at 25 %), or the whole session
+  // while Draw is on. The chart's own series buffers are reused: a point is written only when its value changed,
+  // and the window is rebuilt at most twice a second.
+  static uint8_t hrSpdHist[11], hrBpmHist[11];  // HR mode: speed and bpm each second, [0] = now
+  static int hrHistN;
+  static uint32_t hrHistSec = ~0u, lastDrawMs;
+  static int8_t lastMode = -1;
+  if (hrMode) {
+    uint32_t sec = played / 1000;
+    if (sec != hrHistSec) {
+      if (hrHistSec == ~0u || sec < hrHistSec) hrHistN = 0;  // a new session
+      memmove(hrSpdHist + 1, hrSpdHist, sizeof hrSpdHist - 1);
+      memmove(hrBpmHist + 1, hrBpmHist, sizeof hrBpmHist - 1);
+      hrHistN = min(hrHistN + 1, 11);
+      hrHistSec = sec;
+    }
+    hrSpdHist[0] = control::autopilotSpeed();  // [0] follows the live values within the second
+    hrBpmHist[0] = hr.bpm > 255 ? 255 : hr.bpm;
+  } else {
+    hrHistSec = ~0u;
+  }
+  bool whole = apDraw && !hrMode;
+  int8_t mode = whole ? 2 : hrMode ? 1 : 0;
+  if (mode == 2 || mode != lastMode || (uint32_t)(lv_tick_get() - lastDrawMs) >= 500) {
+    lastDrawMs = lv_tick_get();
+    if (mode != lastMode) {
+      lastMode = mode;
+      lv_obj_set_hidden(apLblNote, !hrMode);
+      lv_obj_set_hidden(apLblNow, whole);
+    }
+    apWinWhole = whole;
+    apWinNow = played;
+    const int ni = whole ? (sess ? min<int>(AP_POINTS - 1, (uint64_t)played * AP_POINTS / sess) : 0) : apwin::nowIndex(AP_POINTS);
+    int32_t *py = lv_chart_get_series_y_array(apChart, apPast);
+    int32_t *fy = lv_chart_get_series_y_array(apChart, apFuture);
+    int32_t *hy = lv_chart_get_series_y_array(apChart, apHrSeries);
+    auto put = [](int32_t *arr, lv_chart_series_t *ser, int i, int v) {
+      int32_t want = v > 0 ? v : LV_CHART_POINT_NONE;
+      if (arr[i] != want) lv_chart_set_value_by_id(apChart, ser, i, want);
+    };
+    for (int i = 0; i < AP_POINTS; i++) {
+      int past = 0, fut = 0, hrv = 0;
+      if (whole) {
+        past = fut = sess ? control::autopilotSpeedAt((uint64_t)i * sess / AP_POINTS) : 0;
+        if (i < ni) fut = 0;
+        if (i > ni) past = 0;
+        if (i == ni) past = fut;
+      } else {
+        int64_t t = apwin::timeAt(i, AP_POINTS, played);
+        if (hrMode) {
+          // Actual speed and bpm of the last 10 s; the future depends on the heart rate, so it is not planned: only the
+          // current target as a dashed flat line.
+          if (i <= ni) {
+            int age = apwin::ageSec(t, played);
+            if (age >= 0 && age < hrHistN) {
+              past = hrSpdHist[age];
+              hrv = hrBpmHist[age] ? constrain((hrBpmHist[age] - 40) * 100 / 180, 1, 100) : 0;
+            }
+          }
+          if (i >= ni && (i == ni || apwin::dashOn(i)) && control::autopilotSpeed() > 0) fut = control::autopilotSpeed();
+        } else if (sess && apwin::inSession(t, sess)) {
+          int v = control::autopilotSpeedAt((uint32_t)t);
+          if (i <= ni) past = v;
+          if (i >= ni) fut = v;
+        }
+      }
+      put(py, apPast, i, past);
+      put(fy, apFuture, i, fut);
+      put(hy, apHrSeries, i, hrv);
+    }
+    lv_chart_set_cursor_point(apChart, apCursor, apFuture, ni);
+    // Axis: seconds relative to now, or the session length when the whole session is shown.
+    char ax[16];
+    if (whole) {
+      snprintf(ax, sizeof ax, "0:00");
+      setLabel(apLblL, ax);
+      snprintf(ax, sizeof ax, "%lu:%02lu", (unsigned long)(sess / 60000), (unsigned long)(sess / 1000 % 60));
+      setLabel(apLblR, ax);
+    } else {
+      snprintf(ax, sizeof ax, "%+d s", apwin::secondsRel(apwin::timeAt(0, AP_POINTS, played), played));
+      setLabel(apLblL, ax);
+      snprintf(ax, sizeof ax, "%+d s", apwin::secondsRel(apwin::timeAt(AP_POINTS - 1, AP_POINTS, played), played));
+      setLabel(apLblR, ax);
+    }
   }
 
   // Scripts
@@ -1385,9 +1810,10 @@ static void refresh(lv_timer_t *) {
 static void themeChanged() {
   apPast->color = themed(Role::ChartPast);
   apFuture->color = themed(Role::ChartFuture);
+  apHrSeries->color = themed(Role::Stop);
   apCursor->color = themed(Role::Pause);
   lv_obj_invalidate(apChart);
-  for (DevRow &r : dvRows) r.dotState = r.selected = r.known = -1;
+  for (DevRow &r : dvRows) r.dotState = r.selected = r.layoutKey = -1;
   refresh(nullptr);  // status dot, battery, Wi-Fi bars, state buttons: read the new palette
 }
 
@@ -1419,6 +1845,43 @@ void uiPump() {
   xSemaphoreGive(callDone);
 }
 
+// ---------- display trial / revert banner ----------
+// A display variant chosen on the setup portal stays "on trial" until Keep is tapped (panelfb.h). After a revert, a
+// notice says so once. Both sit on the top layer along the bottom edge, above the tabs.
+static void showDisplayBanner() {
+  if (!settings.panelTrial && settings.panelRevertedFrom < 0) return;
+  lv_obj_t *bar = lv_obj_create(lv_layer_top());
+  lv_obj_set_size(bar, SCREEN_W, LV_SIZE_CONTENT);
+  lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_obj_set_style_radius(bar, 0, 0);
+  lv_obj_set_style_border_width(bar, 0, 0);
+  theme::bind(bar, Prop::Bg, Role::Accent);
+  lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+  lv_obj_set_style_pad_all(bar, PY(10), 0);
+  lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(bar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_scrollable(bar, false);
+
+  char text[200];
+  if (settings.panelTrial)
+    snprintf(text, sizeof text, "Display \"%s\" is on trial (boot %d of %d). Tap Keep if the picture is right; otherwise it goes back to \"%s\".",
+             panelfb::name(settings.panelVariant), settings.panelBoots, panelfb::TRIAL_BOOTS, panelfb::name(settings.panelPrev));
+  else
+    snprintf(text, sizeof text, "The display setting \"%s\" was not confirmed, so the panel went back to \"%s\".",
+             panelfb::name(settings.panelRevertedFrom), panelfb::name(settings.panelVariant));
+  lv_obj_t *l = lv_label_create(bar);
+  lv_label_set_text(l, text);
+  lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_font(l, &lv_font_montserrat_24, 0);
+  lv_obj_set_flex_grow(l, 1);
+  bool trial = settings.panelTrial;
+  button(bar, trial ? "Keep" : "OK", PX(180), PY(60), Role::Start, [](lv_event_t *e) {
+    if (settings.panelTrial) settingsConfirmPanel();
+    settings.panelRevertedFrom = -1;
+    lv_obj_delete_async((lv_obj_t *)lv_event_get_user_data(e));
+  }, bar);
+}
+
 void uiBegin() {
   UiLock lock;  // LVGL's own task is already running (boardBegin)
   callSlot = xSemaphoreCreateMutex();
@@ -1442,6 +1905,7 @@ void uiBegin() {
   buildDevices(lv_tabview_add_tab(tv, "Devices"));
   buildSettings(lv_tabview_add_tab(tv, LV_SYMBOL_SETTINGS " Settings"));
 
+  showDisplayBanner();
   lv_timer_create(refresh, 200, nullptr);
   refresh(nullptr);
 }

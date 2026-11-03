@@ -16,10 +16,16 @@
 #include "board.h"
 #include "control.h"
 #include "devices.h"
+#include "encoder.h"
 #include "log.h"
+#include "loginlimit.h"
+#include "otapw.h"
+#include "p4bus.h"
+#include "pclkfb.h"
 #include "rollback.h"
-#include "secrets.h"
+#include "build_config.h"
 #include "settings.h"
+#include "setupform.h"
 #include "theme.h"
 #include "ui.h"
 #include "version.h"
@@ -28,9 +34,33 @@
 static WebServer server(80);
 static DNSServer dns;    // setup portal: every name resolves to the panel
 static bool authorized;  // for the upload in progress; cleared when it ends
+static loginlimit::State loginState;  // 5 wrong passwords in a row lock the web login for 60 s
+
+// Web admin login (user "ota", password from otapw.h). 403 until the panel has a password at all, 401 for a wrong one.
+// An empty password never matches: known() is checked first.
+// Counts wrong passwords (5 in a row lock it for 60 s). Every route goes through here, the upload start included.
+static bool authOk() {
+  if (!otapw::known()) return false;
+  uint32_t now = millis();
+  if (loginlimit::blocked(loginState, now)) return false;  // no comparison at all, not even for the right password
+  if (server.authenticate("ota", otapw::get())) {
+    loginlimit::success(loginState);
+    return true;
+  }
+  if (server.hasHeader("Authorization")) loginlimit::failure(loginState, now);  // credentials were sent and are wrong (none = a browser's first visit)
+  return false;
+}
 
 static bool login() {
-  if (server.authenticate("ota", OTA_PASSWORD)) return true;
+  if (!otapw::known()) {
+    server.send(403, "text/plain", "The web admin is locked: this panel has no web password yet. Restart it; the password is shown on its Settings tab.\n");
+    return false;
+  }
+  if (loginlimit::blocked(loginState, millis())) {
+    server.send(429, "text/plain", "Too many wrong passwords: wait " + String(loginlimit::remainingSec(loginState, millis())) + " s and try again.\n");
+    return false;
+  }
+  if (authOk()) return true;
   server.requestAuthentication(BASIC_AUTH, "twiddle");  // realm (was the library default)
   return false;
 }
@@ -38,7 +68,7 @@ static bool login() {
 static void onUpload() {
   HTTPUpload &u = server.upload();
   if (u.status == UPLOAD_FILE_START) {
-    authorized = server.authenticate("ota", OTA_PASSWORD);
+    authorized = authOk();
     if (!authorized) return;
     Serial.printf("OTA: receiving %s\n", u.filename.c_str());
     {
@@ -72,7 +102,10 @@ static void onUpload() {
 static void onDone() {
   bool ok = authorized;
   authorized = false;
-  if (!ok || !login()) return;
+  if (!ok) {  // refused when the upload began: say why (403 locked / 401 wrong password) instead of hanging up
+    if (login()) server.send(400, "text/plain", "no firmware received\n");
+    return;
+  }
   if (Update.hasError()) {
     {
       UiLock l;
@@ -93,8 +126,8 @@ static void onDone() {
 }
 
 // GET /screenshot[?tab=0..5]: the screen as a 16-bit BMP (login: it can switch
-// tabs, and Settings, tab 5 since Devices came in at 4, shows Wi-Fi and the
-// token's tail: never publish a screenshot of it). The frame buffer is
+// tabs, and Settings, tab 5 since Devices came in at 4, shows Wi-Fi, the
+// token's tail and the web password: never publish a screenshot of it). The frame buffer is
 // read without the lock: the UI keeps running, at the cost of a torn frame if
 // something redraws meanwhile.
 static void onScreenshot() {
@@ -167,12 +200,15 @@ static void i2cReport(void *arg) {
     int v = readReg(Wire, 0x75, reg);
     out += "IP5306 reg 0x" + String(reg, HEX) + " = " + (v < 0 ? String("no answer") : "0x" + String(v, HEX)) + "\n";
   }
-  if (battery::usesP4()) {
+  if (encoder::ownsP4()) {  // the encoder (and a gauge at another address) hold the bus: scan it as it is
+    p4bus::begin();
+    out += "P4 pins (SDA 17, SCL 18), encoder " + String(encoder::present() ? "found at 0x" + String(encoder::address(), HEX) : "not answering") + ":" + scanBus(Wire1) + "\n";
+  } else if (battery::usesP4()) {
     out += "P4 pins (SDA 17, SCL 18): in use by the fuel gauge\n";
   } else {
-    Wire1.begin(17, 18, 100000);
+    p4bus::begin();
     out += "P4 pins (SDA 17, SCL 18):" + scanBus(Wire1) + "\n";
-    Wire1.end();
+    p4bus::end();
   }
 #endif
 }
@@ -234,6 +270,42 @@ static String htmlEscape(const String &s) {
   return o;
 }
 
+// The web login note. The password itself is NEVER on a web page: the Twiddle-Setup AP password is public (it is in the
+// docs), so anyone in range could read it. It is shown only on the panel's own Settings tab ("Web login").
+// Only while the setup portal is up; on the LAN the page already needs the login.
+static String webLoginBox() {
+  if (!wlan::portalActive()) return "";
+  if (!otapw::known())
+    return "<div style='border:1px solid #555;border-radius:8px;padding:10px 14px;margin:14px 0'><b>Web login</b><br>"
+           "The panel is still making its password; reload in a few seconds. If this stays, the web admin stays locked: "
+           "restart the panel.</div>";
+  return "<div style='border:1px solid #555;border-radius:8px;padding:10px 14px;margin:14px 0'><b>Web login</b> for updates and the web admin<br>"
+         "Read the password <b>on the panel</b>: Settings tab, <b>Web login</b> (user <code>ota</code>). "
+         "It is not shown on this page on purpose. Write it down; it is needed for <code>./ota.sh</code> and for opening "
+         "this page once the panel is on your network. Tapping it on the panel resets it.</div>";
+}
+
+// Guition only: the display pixel clock. A unit with the wrong one shows a colour pattern or shakes.
+static String displayField() {
+#if defined(BOARD_WAVESHARE_LCD5)
+  return "";
+#else
+  String o = "<label>Display pixel clock</label><select name=pclk>";
+  // 12..18, plus a saved value outside that (set over /pclk): otherwise the browser would preselect 12 and a save would change it
+  for (int mhz = min(12, settings.pclkMHz); mhz <= max(18, settings.pclkMHz); mhz++)
+    o += "<option" + String(mhz == settings.pclkMHz ? " selected" : "") + ">" + String(mhz) + "</option>";
+  o += "</select><small>Display test: if the screen shows a colour pattern (white, red, green, blue, black in turn) or "
+       "shakes, pick another value (most units 16, a few 14), Save, and look at the screen after the restart. "
+       "If the picture is right, <b>tap Keep on the panel</b>; if not, switch the panel off and on three times and it returns to "
+       "the previous value by itself. Leave it alone when the screen is fine.</small>";
+  if (settings.pclkTrial)
+    o += "<p><small>Now on trial: " + String(settings.pclkMHz) + " MHz (boot " + String(settings.pclkBoots) + " of " +
+         String(pclkfb::TRIAL_BOOTS) + "). Without a tap on <b>Keep</b> on the panel it goes back to " +
+         String(settings.pclkPrev) + " MHz.</small></p>";
+  return o;
+#endif
+}
+
 static void onSetupGet() {
   if (!wlan::portalActive() && !login()) return;
   int n = WiFi.scanComplete();
@@ -245,6 +317,8 @@ static void onSetupGet() {
     options += "<option value=\"" + htmlEscape(ssid) + "\"" + (ssid == settings.wifiSsid ? " selected" : "") + ">" +
                htmlEscape(ssid) + " (" + WiFi.RSSI(i) + " dBm)</option>";
   }
+  String keepPass = settings.wifiPass.length() ? " placeholder='(saved, leave empty to keep)'" : "";
+  String keepToken = settings.token.length() ? " placeholder='(saved, leave empty to keep)'" : "";
   String page =
       "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
       "<title>Twiddle setup</title>"
@@ -252,21 +326,26 @@ static void onSetupGet() {
       "label{display:block;margin:14px 0 4px}input,select,button{width:100%;font:inherit;padding:10px;"
       "border-radius:8px;border:1px solid #555;background:#2a302c;color:#eee;box-sizing:border-box}"
       "button{background:#2e7d32;border:0;margin-top:20px}small{color:#9aa}</style>"
-      "<h2>Twiddle setup</h2><form method=post action=/setup>"
+      "<h2>Twiddle setup</h2>" + webLoginBox() + "<form method=post action=/setup autocomplete=off>"
       "<label>Wi-Fi network</label><select name=pick>" + options +
       "<option value=''>Other / hidden (type below)</option></select>"
-      "<input name=ssid placeholder='Network name, if not in the list' value=''>"
-      "<label>Wi-Fi password</label><input name=pass type=password value=\"" + htmlEscape(settings.wifiPass) + "\">"
-      "<label>Autoblow device token</label><input name=token value=\"" + htmlEscape(settings.token) + "\">"
-      "<small>From the Autoblow web app's device settings.</small>"
+      "<input name=ssid autocomplete=off placeholder='Network name, if not in the list' value=''>"
+      "<label>Wi-Fi password</label><input name=pass type=password autocomplete=off value=''" + keepPass + ">"
+      "<label>Autoblow device token</label><input name=token autocomplete=off value=''" + keepToken + ">"
+      "<small>From the Autoblow web app's device settings. Stored values are never shown; leave a field empty to keep it.</small>"
+      + displayField() +
       "<button>Save and restart</button></form>"
       "<p><small>" FW_VERSION ", " BOARD_NAME ". Networks: " + String(n > 0 ? n : 0) + " found, "
       "<a href=/setup style='color:#8fd'>refresh</a>.</small></p>";
+  server.sendHeader("Cache-Control", "no-store");
   server.send(200, "text/html", page);
 }
 
+static int pclkNew;  // a clock chosen on the setup page that differs from the current one, else 0
+
 static void applySetup(void *) {
   settingsSave();
+  if (pclkNew) settingsSelectPclk(pclkNew);  // starts a trial (pclkfb.h)
   control::stopAndRestart();
 }
 
@@ -276,15 +355,21 @@ static void onSetupPost() {
   ssid.trim();
   if (!ssid.length()) ssid = server.arg("pick");
   if (!ssid.length()) return server.send(400, "text/plain", "Pick or type a Wi-Fi network.\n");
+  // Stored secrets are never echoed into the form, so an empty field means "keep" (setupform.h).
+  bool sameNet = ssid == settings.wifiSsid;
   settings.wifiSsid = ssid;
-  settings.wifiPass = server.arg("pass");
-  settings.token = server.arg("token");
-  settings.token.trim();
+  settings.wifiPass = setupform::wifiPass(settings.wifiPass.c_str(), server.arg("pass").c_str(), sameNet).c_str();
+  settings.token = setupform::token(settings.token.c_str(), server.arg("token").c_str()).c_str();
+#if !defined(BOARD_WAVESHARE_LCD5)
+  int mhz = server.hasArg("pclk") ? server.arg("pclk").toInt() : 0;
+  pclkNew = pclkfb::validMHz(mhz) && mhz != settings.pclkMHz ? mhz : 0;
+#endif
   server.send(200, "text/html",
               "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
               "<body style='font:17px system-ui;margin:24px;background:#1b1f1d;color:#eee'>"
               "<h2>Saved</h2><p>The panel restarts and joins <b>" + htmlEscape(ssid) + "</b>. "
-              "Its status bar shows how that goes.</p>");
+              "Its status bar shows how that goes.</p>" + webLoginBox() +
+              "<p>If the screen is blank or garbled, join <b>Twiddle-Setup</b> again and check <i>Display pixel clock</i> on the setup page.</p>");
   delay(200);
   uiCall(applySetup, nullptr);
 }
@@ -321,18 +406,21 @@ void otaBegin() {
     boardBacklightRaw(constrain(d, -1, 255));
     server.send(200, "text/plain", String("backlight duty ") + d + "\n");
   });
-  // GET /pclk -> current display pixel clock; ?mhz=N (10..20) saves it, then restart (POST /restart) to apply.
-  // For a unit whose screen shows the panel's colour self-test at the default 14 MHz: try 16.
+  // GET /pclk -> current display pixel clock; ?mhz=N (10..20) saves it as a trial, then restart (POST /restart) to apply.
+  // A screen showing a colour pattern (white, red, green, blue, black in turn) or shaking: try 14 / 15 / 16.
   server.on("/pclk", HTTP_GET, [] {
     if (!login()) return;
     if (server.hasArg("mhz")) {
       int mhz = server.arg("mhz").toInt();
-      if (mhz < 10 || mhz > 20) return server.send(400, "text/plain", "mhz must be 10..20\n");
+      if (!pclkfb::validMHz(mhz)) return server.send(400, "text/plain", "mhz must be 10..20\n");
       UiLock l;
-      settings.pclkMHz = mhz;
-      settingsSavePclk();
+      settingsSelectPclk(mhz);  // a different clock starts a trial: tap Keep on the panel after the restart
     }
-    server.send(200, "text/plain", String("pclk ") + settings.pclkMHz + " MHz (applies after a restart)\n");
+    String out = String("pclk ") + settings.pclkMHz + " MHz (applies after a restart)";
+    if (settings.pclkTrial)
+      out += String(", on trial (boot ") + settings.pclkBoots + " of " + pclkfb::TRIAL_BOOTS + "; tap Keep on the panel, else back to " +
+             settings.pclkPrev + " MHz)";
+    server.send(200, "text/plain", out + "\n");
   });
   // GET /theme -> current theme and the list; ?n=N switches live (not saved), ?n=N&save=1 keeps it.
   server.on("/theme", HTTP_GET, [] {
@@ -389,6 +477,10 @@ void otaBegin() {
   server.on("/screenshot", HTTP_GET, onScreenshot);
   // Build time + probation state, so ota.sh can tell whether an update stuck.
   server.on("/", HTTP_GET, [] {
+    if (wlan::portalActive()) {  // on the setup access point the root is the setup form
+      server.sendHeader("Location", "/setup");
+      return server.send(302, "text/plain", "");
+    }
     // __DATE__/__TIME__ only change when this file recompiles; the ELF hash
     // changes with every build, so ota.sh compares that.
     char sha[17];

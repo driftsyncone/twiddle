@@ -3,7 +3,7 @@
 
 namespace toys {
 
-static const Driver *const ALL[] = {&lovense, &keon, &keon2, &ossm};
+static const Driver *const ALL[] = {&lovense, &keon, &keon2, &ossm, &hrmDriver};
 
 const Driver *match(const NimBLEAdvertisedDevice &adv) {
   for (const Driver *d : ALL)

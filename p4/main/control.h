@@ -59,6 +59,22 @@ void autopilotSeek(uint32_t t);  // jump to t ms into the session
 void autopilotSetPeak(int wave, int peak);
 int autopilotPeak(int wave);
 void autopilotClearPeaks();
+// HR edging (edge.h): Autopilot driven by a BLE heart rate monitor. Off by default; off = the plain
+// Autopilot, untouched. In this mode the speed is the edge controller's, Length applies, and
+// More / graph seek do nothing; Back off drops to rest. A start always begins a fresh HR session.
+void autopilotSetHrEdging(bool on);
+bool autopilotHrEdging();
+void autopilotHrApply();       // settings.hr* changed: take them over (also mid-session)
+void autopilotHrLearnEdge();   // edge bpm := the current bpm (needs a fresh reading); saved
+struct HrStatus {
+  int phase;      // 0 climb, 1 hold-off (edge), 2 rest, 3 signal lost, 4 done, -1 not running
+  int edges, maxEdges;
+  int edgeBpm;    // the current trigger (it rises with every cycle)
+  int bpm;        // 0 = no reading
+  int end;        // why a finished session ended: 0 running/none, 1 edges, 2 length, 3 signal lost
+};
+HrStatus autopilotHrStatus();
+int autopilotHrBpmAt(uint32_t t);  // graph: recorded bpm at t ms into the session (0 none)
 void autopilotSaveFavourite(int slot);  // the current peaks
 bool autopilotLoadFavourite(int slot);  // false if the slot is empty
 

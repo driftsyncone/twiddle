@@ -35,11 +35,15 @@ different `PANEL_HOSTNAME` values in `secrets.h`).
 If no Wi-Fi network name is stored (a build with an empty `WIFI_SSID` and nothing saved yet), the panel starts in
 **setup portal mode**:
 
-1. The status bar at the top shows: `setup: join Wi-Fi Twiddle-Setup (pw twiddle-setup), open 192.168.4.1`.
+(The panel's own screen also asks for Wi-Fi on first start: Scan, pick the network, password, Save & restart. The steps below are the phone route, the fallback for a black or garbled screen.)
+
+1. The status bar at the top shows: `setup: join Wi-Fi Twiddle-Setup (pw twiddle-setup), open 192.168.4.1/setup`.
 2. On a phone or laptop, join the Wi-Fi network **Twiddle-Setup** (password **twiddle-setup**; WPA2, up to four
    devices at once).
-3. Open `http://192.168.4.1/` in a browser. Most phones open it by themselves as a "sign in to network" page,
-   because the panel redirects every address to the setup page.
+3. Open `http://192.168.4.1/setup` in a browser (`http://192.168.4.1/` redirects there). Most phones open it by themselves
+   as a "sign in to network" page, because the panel redirects every address to the setup page.
+   **Check the form before saving:** a phone browser may refill old Wi-Fi or token values from an earlier setup; the panel
+   never shows stored passwords or tokens, so anything already typed in a field is the browser's, not the panel's.
 4. On the **Twiddle setup** page:
    - **Wi-Fi network**: pick one from the list (shown with signal strength) or choose *Other / hidden* and type
      the name in the box below. The list is scanned in the background: use the *refresh* link if it is empty.
@@ -120,7 +124,7 @@ session starts automatically.
 |---|---|
 | **Start** / **Pause** | Start the session, or pause it. Resuming continues where it paused |
 | Status text next to it | While running: current speed and `peak in m:ss` (or `at the peak`), and time left. When stopped: `Standby` and the planned length in minutes |
-| **Graph** | The planned speed over time: played part grey-blue, upcoming part lighter, with a marker at the current position. **Tap** it to jump to that point in the session. When *Draw* is on (Session tab), dragging on it sets the peak of the wave under your finger |
+| **Graph** | A moving window on the planned speed: the last 10 s (grey-blue) and the next 30 s (lighter), with a marker for *now* at 25 % from the left and an axis in seconds relative to now. **Tap** it to jump to that moment. While *Draw* is on (Session tab) it shows the whole session instead, and dragging on it sets the peak of the wave under your finger |
 | **Back off** | Drop to rest now (during Climb or Hold), or make the current rest 5 s longer |
 | **More** | During Climb: go to the peak now. During Hold: hold 5 s longer and 5 % higher. During Rest: skip the rest and start the next wave |
 | **Finish Me** | Switches to the Remote path at **100 %** with no vacuum pulses and both valves released. Press **Pause** (Remote tab) or STOP to end it |
@@ -176,7 +180,7 @@ Each card shows, left to right:
 | Name and status line | For example `Ready`, `Connecting...`, `Out of range`, or an error. A running device adds `at 40%`; a toy adds its battery and signal strength (`... 82%`, `... -60 dBm`). The cloud device says **Set the token in Settings** if no token is stored |
 | **Follow** switch | On: this device receives the panel's output. The Autoblow device starts with Follow on |
 | **25% / 50% / 75% / 100%** | The scale: this device gets that percentage of the panel's speed (the Autoblow device never goes below 5 %) |
-| **Connect** / **Forget** (toys only) | Connect remembers the toy: it then reconnects by itself, now and after every restart, retrying after 15, 30, 60, then every 120 seconds while it is away. Forget disconnects and removes it |
+| **Connect** / **Forget** (toys only) | Connect remembers the toy: it then reconnects by itself, now and after every restart, retrying after 15, 30, 60, then every 120 seconds while it is away. A remembered toy that is not connected shows **Connect** (tries at once, restarts the retry timer) next to **Forget**; while connecting the button reads "Connecting"; once up only **Forget** shows. Forget disconnects and removes it. A heart rate monitor's row has no Follow switch or 25-100 % buttons (it is an input), and tapping it does not select it |
 
 A toy you connect on purpose starts with Follow **on** at 100 %. A selected device gets a thick coloured border.
 Tap a card (outside its switch, scale or button) to make it the selected device.
@@ -185,6 +189,32 @@ Supported toys are those matched by the built-in drivers: Lovense toys, Kiiroo K
 toy has been tested on this hardware yet.
 
 While a VacuGlide **script** is playing, Bluetooth toys rest (a script has no speed to share).
+
+### HR edging (heart rate drives Autopilot)
+**Build and unit-test verified only: no board test with a real heart rate monitor yet.** On the Devices tab, wear a standard
+BLE heart rate monitor (chest strap or watch broadcasting the Heart Rate Service; the Polar H10 is the recommended one, with
+"two BLE devices" switched on once in the Polar app), Scan and Connect. It shows its bpm on its card and takes no output (no
+Follow, no scale). It uses one of the **3 Bluetooth links** shared with the toys: if all 3 are in use the card says
+"No free Bluetooth link: disconnect a toy first" (Forget a toy, then Connect); no toy is ever dropped for it.
+
+On the Session tab set **HR edging** to On. Autopilot then climbs like normal, **edges** when the bpm reaches the edge bpm (or
+rises by Fast rise bpm within 10 s), drops to the floor of the Intensity level, rests until the bpm is down by the Recovery
+drop and a minimum rest has passed, raises the edge bpm by Raise per edge and climbs again. It ends after the set number of
+Edges or the Length, and if the heart rate signal is lost for more than 5 s it goes to the floor and then stops.
+The speed never goes above the Intensity ceiling. **Back off** rests now; **More** and tapping the graph do nothing in this mode;
+every Start begins a new HR session. STOP, the lost-device handshake and the low-battery stop work as always.
+
+| Setting | Meaning |
+|---|---|
+| **Resting bpm** | Your resting rate (the edge is kept at least 10 above it, recovery at least 3 above it) |
+| **Edge bpm** / **Learn** | The trigger. **Learn** copies the current bpm into it (needs a live reading) |
+| **Recovery drop** | Rest until bpm <= edge bpm minus this |
+| **Edges** | Session ends after this many edges (no limit = 0) |
+| **Raise per edge** | Added to the edge bpm after each finished cycle |
+| **Fast rise** | A second trigger: this many bpm gained within 10 s (off below 8) |
+
+The Autopilot tab shows the bpm, the phase and the edge count; the graph shows the last 10 s of actual speed and a red heart rate line
+(40 to 220 bpm over the 0 to 100 axis). The future depends on your heart rate, so ahead it only shows the current target speed as a dashed flat line ("HR-driven: depends on heart rate").
 
 ## Settings tab
 

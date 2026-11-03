@@ -2,6 +2,7 @@
 // screenshot, setup portal. Slow requests never stall the UI; anything touching the UI,
 // control:: or shared hardware takes UiLock.
 #include "ota.h"
+#include "portalroute.h"
 
 #include <Arduino.h>
 #include <string>
@@ -18,46 +19,63 @@
 #include "autoblow.h"
 #include "ble.h"
 #include "board.h"
+#include "chiprev.h"
+#include "esp_chip_info.h"
 #include "control.h"
 #include "devices.h"
 #include "log.h"
+#include "esp_timer.h"
+#include "loginlimit.h"
+#include "otapw.h"
+#include "panelfb.h"
 #include "rollback.h"
-#include "secrets.h"
+#include "build_config.h"
 #include "settings.h"
 #include "theme.h"
 #include "ui.h"
 #include "version.h"
 #include "wlan.h"
 
-// ota.sh reads OTA_PASSWORD from secrets.h; the P4 bring-up secrets.h called it OTA_PASS.
-#if defined(OTA_PASSWORD)
-#define OTA_SECRET OTA_PASSWORD
-#elif defined(OTA_PASS)
-#define OTA_SECRET OTA_PASS
-#else
-#define OTA_SECRET ""  // no password configured: every login fails
-#endif
+
 #ifndef BOARD_NAME
 #define BOARD_NAME "Guition JC1060P470C"
 #endif
 
 static const char *TAG = "web";
 static httpd_handle_t server;
-static std::string expectedAuth;  // "Basic base64(ota:password)"
+static loginlimit::State loginState;  // 5 wrong passwords in a row lock the web login for 60 s
 
 // ---------- helpers ----------
 
+// Every admin endpoint goes through here. No password known (it could not be made or stored): 403, never an
+// empty-password accept. Wrong or missing credentials: 401 after a short pause, which caps guessing at ~2 per second.
 static bool login(httpd_req_t *req) {
-  if (sizeof(OTA_SECRET) > 1) {
-    size_t n = httpd_req_get_hdr_value_len(req, "Authorization");
-    if (n > 0 && n < 200) {
-      char h[200];
-      if (httpd_req_get_hdr_value_str(req, "Authorization", h, sizeof h) == ESP_OK && expectedAuth == h) return true;
+  if (!otapw::known()) {
+    httpd_resp_set_status(req, "403 Forbidden");
+    httpd_resp_send(req, "web admin is locked: this panel has no web password (see the Settings tab)\n", HTTPD_RESP_USE_STRLEN);
+    return false;
+  }
+  uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+  if (loginlimit::blocked(loginState, now)) {  // too many wrong passwords: no comparison at all, not even for the right one
+    char msg[96];
+    snprintf(msg, sizeof msg, "too many wrong passwords: wait %u s and try again\n", (unsigned)loginlimit::remainingSec(loginState, now));
+    httpd_resp_set_status(req, "429 Too Many Requests");
+    httpd_resp_send(req, msg, HTTPD_RESP_USE_STRLEN);
+    return false;
+  }
+  size_t n = httpd_req_get_hdr_value_len(req, "Authorization");
+  if (n > 0 && n < 200) {
+    char h[200];
+    if (httpd_req_get_hdr_value_str(req, "Authorization", h, sizeof h) == ESP_OK && otapw::authorised(h)) {
+      loginlimit::success(loginState);
+      return true;
     }
   }
+  if (n > 0) loginlimit::failure(loginState, now);  // credentials were sent and are wrong (no header = a browser's first visit)
+  vTaskDelay(pdMS_TO_TICKS(500));
   httpd_resp_set_status(req, "401 Unauthorized");
-  httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"twiddle\"");
-  httpd_resp_send(req, "login required\n", HTTPD_RESP_USE_STRLEN);
+  httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"twiddle\", charset=\"UTF-8\"");
+  httpd_resp_send(req, "login required (user ota, password: Settings tab)\n", HTTPD_RESP_USE_STRLEN);
   return false;
 }
 
@@ -274,17 +292,30 @@ static const char *resetReason() {
 }
 
 static esp_err_t onStatus(httpd_req_t *req) {
+  if (wlan::portalActive()) {  // on the setup AP, / is the setup form
+    char host[64] = "";
+    httpd_req_get_hdr_value_str(req, "Host", host, sizeof host);
+    if (portalroute::rootGoesToSetup(true, host, wlan::portalIp().c_str())) {
+      httpd_resp_set_status(req, "302 Found");
+      httpd_resp_set_hdr(req, "Location", "/setup");
+      return httpd_resp_send(req, "", 0);
+    }
+  }
   // __DATE__/__TIME__ only change when this file recompiles; the ELF hash changes with every
   // build, so ota.sh compares that.
   char sha[17];
   esp_app_get_elf_sha256(sha, sizeof sha);
   autoblow::Status st = autoblow::status();
-  char b[900];
+  esp_chip_info_t ci;
+  esp_chip_info(&ci);
+  const char *rw = chiprev::warning(ci.revision);
+  char b[1100];
   snprintf(b, sizeof b,
            "twiddle " FW_VERSION "\nbuilt " __DATE__ " " __TIME__ "\nid: %s\nboard: " BOARD_NAME
+           "\nchip: ESP32-P4 rev v%u.%u%s%s"
            "\nfirmware: %s\ndisplay fixes: %d\nreset: %s\ndevice: %s %s\nheap: %u free, largest %u\n%s"
            "bluetooth: %s\ncloud: lost %u" "x, silent %u ms, grace %u s, uptime %u s\n",
-           sha, rollback::state(), boardDisplayGuard(), resetReason(), st.online ? "online" : "offline", st.error,
+           sha, (unsigned)ci.revision / 100, (unsigned)ci.revision % 100, rw ? ", " : "", rw ? rw : "", rollback::state(), boardDisplayGuard(), resetReason(), st.online ? "online" : "offline", st.error,
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL), wlan::report().c_str(),
            ble::enabled() ? "on" : "off", (unsigned)st.lost, (unsigned)st.silentMs, (unsigned)(st.graceMs / 1000),
@@ -408,19 +439,27 @@ static esp_err_t onTheme(httpd_req_t *req) {
   return sendText(req, "200 OK", out);
 }
 
-// GET /panel -> display panel variant; ?v=0 (V2, default) or ?v=1 (original) saves it, then restart (POST /restart).
-// For a unit whose screen stays black although the UI is drawn (GET /screenshot shows it): try the other variant.
+// GET /panel -> display panel variant; ?v=0..4 chooses it (see the list in the reply) and starts a TRIAL: restart
+// (POST /restart), tap "Keep" on the panel's screen, or after 3 unconfirmed boots it goes back to the previous variant.
+// ?v=N&keep=1 skips the trial (scripted use; a wrong variant then stays until changed again).
+// For a unit whose screen stays black although the UI is drawn (GET /screenshot shows it): try another variant.
 static esp_err_t onPanel(httpd_req_t *req) {
   if (!login(req)) return ESP_OK;
   std::string v = queryArg(req, "v");
   if (!v.empty()) {
     int n = atoi(v.c_str());
-    if (n < 0 || n > 4) return sendText(req, "400 Bad Request", "v must be 0..3 (bit0 original table, bit1 swapped reset pin)\n");
+    if (!panelfb::validVariant(n)) return sendText(req, "400 Bad Request", "v must be 0..4\n");
     UiLock l;
-    settings.panelVariant = n;
-    settingsSavePanel();
+    settingsSelectPanel(n);
+    if (queryArg(req, "keep") == "1") settingsConfirmPanel();
   }
-  return sendText(req, "200 OK", std::string("panel ") + std::to_string(settings.panelVariant) + " (applies after a restart)\n");
+  std::string out = "panel " + std::to_string(settings.panelVariant) + " (" + panelfb::name(settings.panelVariant) + ")";
+  if (settings.panelTrial)
+    out += ", on trial (" + std::to_string(settings.panelBoots) + " of " + std::to_string(panelfb::TRIAL_BOOTS) +
+           " boots used), confirmed variant " + std::to_string(settings.panelPrev);
+  out += "; applies after a restart\n";
+  for (int i = 0; i < panelfb::VARIANTS; i++) out += std::to_string(i) + " " + panelfb::name(i) + "\n";
+  return sendText(req, "200 OK", out);
 }
 
 // ---------- small POST/GET controls ----------
@@ -463,6 +502,62 @@ static esp_err_t onBacklight(httpd_req_t *req) {
   return sendText(req, "200 OK", "backlight duty " + std::to_string(duty) + "\n");
 }
 
+// ---------- setup portal: shared page pieces ----------
+
+static const char *PORTAL_STYLE =
+    "<style>body{font:17px system-ui;margin:24px auto;max-width:420px;padding:0 16px;background:#1b1f1d;color:#eee}"
+    "label{display:block;margin:14px 0 4px}input,select,button{width:100%;font:inherit;padding:10px;"
+    "border-radius:8px;border:1px solid #555;background:#2a302c;color:#eee;box-sizing:border-box}"
+    "button{background:#2e7d32;border:0;margin-top:20px}small{color:#9aa}code{font:20px ui-monospace,monospace;"
+    "letter-spacing:2px;color:#fc8}.box{border:1px solid #555;border-radius:8px;padding:10px 14px;margin:14px 0}"
+    "details{margin-top:24px}summary{cursor:pointer;color:#8fd}</style>";
+
+// The web login note. The password itself is NEVER on a web page: the Twiddle-Setup AP password is public (it is in
+// the docs), so anyone in range could read it. It is shown only on the panel's own Settings tab ("Web login").
+// Only while the setup portal is up; on the LAN the page already needs the login.
+static std::string webLoginBox() {
+  if (!wlan::portalActive()) return "";
+  if (!otapw::known())
+    return "<div class=box><b>Web login</b><br>No password could be made on this panel; "
+           "the web admin stays locked. Restart the panel to try again.</div>";
+  return "<div class=box><b>Web login</b> for updates and the web admin<br>"
+         "Read the password <b>on the panel</b>: Settings tab, <b>Web login</b> (user <code>ota</code>). "
+         "It is not shown on this page on purpose. Write it down; it is needed for <code>./ota.sh</code> and for opening "
+         "this page once the panel is on your network. Tapping it on the panel resets it.</div>";
+}
+
+static const char *variantLabel(int v) {
+  switch (v) {
+    case 0: return "Standard: V2 (default, most panels)";
+    case 4: return "New panel: black plastic case, no label on the back (JC1060P470C_I_W_Y)";
+    case 1: return "Original: older boards";
+    case 2: return "V2 timing, reset pin 5 (advanced)";
+    case 3: return "Original timing, reset pin 0 (advanced)";
+    default: return "?";
+  }
+}
+
+// "My screen looks wrong": a select of display variants. Posts to /display, which saves and restarts. The panel never
+// reads the display's ID registers (a register read blanks the new panel), so this is the user's choice.
+static std::string displaySection() {
+  static const int ORDER[] = {0, 4, 1, 2, 3};
+  std::string o;
+  for (int v : ORDER)
+    o += "<option value=" + std::to_string(v) + (v == settings.panelVariant ? " selected" : "") + ">" +
+         htmlEscape(variantLabel(v)) + "</option>";
+  std::string note;
+  if (settings.panelTrial)
+    note = "<p><small>Now on trial: " + htmlEscape(variantLabel(settings.panelVariant)) + " (boot " +
+           std::to_string(settings.panelBoots) + " of " + std::to_string(panelfb::TRIAL_BOOTS) +
+           "). Without a tap on <b>Keep</b> on the panel it goes back to " + htmlEscape(variantLabel(settings.panelPrev)) + ".</small></p>";
+  return "<details" + std::string(settings.panelTrial ? " open" : "") + "><summary>My screen looks wrong</summary>"
+         "<p>Black, washed-out or shifting picture while the panel is on? Pick the display type and restart. "
+         "If the new choice works, <b>tap Keep on the panel</b>. If the screen stays black, just switch the panel off and on "
+         "three times: it returns to the previous choice by itself.</p>" + note +
+         "<form method=post action=/display><label>Display</label><select name=v>" + o + "</select>"
+         "<button>Use this display and restart</button></form></details>";
+}
+
 // ---------- setup portal: GET/POST /setup ----------
 // Reachable by anyone on the portal network while the panel isn't configured;
 // on the LAN it needs the OTA login (it changes Wi-Fi and the token).
@@ -480,23 +575,23 @@ static esp_err_t onSetupGet(httpd_req_t *req) {
     options += "<option value=\"" + esc + "\"" + (ssid == settings.wifiSsid.c_str() ? " selected" : "") + ">" + esc +
                " (" + std::to_string(wlan::scanRssi(i)) + " dBm)</option>";
   }
+  std::string keep = settings.wifiPass.length() ? " placeholder='(saved, leave empty to keep)'" : "";
+  std::string keepTok = settings.token.length() ? " placeholder='(saved, leave empty to keep)'" : "";
   std::string page =
-      "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
-      "<title>Twiddle setup</title>"
-      "<style>body{font:17px system-ui;margin:24px auto;max-width:420px;padding:0 16px;background:#1b1f1d;color:#eee}"
-      "label{display:block;margin:14px 0 4px}input,select,button{width:100%;font:inherit;padding:10px;"
-      "border-radius:8px;border:1px solid #555;background:#2a302c;color:#eee;box-sizing:border-box}"
-      "button{background:#2e7d32;border:0;margin-top:20px}small{color:#9aa}</style>"
-      "<h2>Twiddle setup</h2><form method=post action=/setup>"
+      std::string("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+      "<title>Twiddle setup</title>") + PORTAL_STYLE +
+      "<h2>Twiddle setup</h2>" + webLoginBox() + "<form method=post action=/setup autocomplete=off>"
       "<label>Wi-Fi network</label><select name=pick>" + options +
       "<option value=''>Other / hidden (type below)</option></select>"
-      "<input name=ssid placeholder='Network name, if not in the list' value=''>"
-      "<label>Wi-Fi password</label><input name=pass type=password value=\"" + htmlEscape(settings.wifiPass.c_str()) + "\">"
-      "<label>Autoblow device token</label><input name=token value=\"" + htmlEscape(settings.token.c_str()) + "\">"
-      "<small>From the Autoblow web app's device settings.</small>"
+      "<input name=ssid autocomplete=off placeholder='Network name, if not in the list' value=''>"
+      "<label>Wi-Fi password</label><input name=pass type=password autocomplete=off value=''" + keep + ">"
+      "<label>Autoblow device token</label><input name=token autocomplete=off value=''" + keepTok + ">"
+      "<small>From the Autoblow web app's device settings. Stored values are never shown; leave a field empty to keep it.</small>"
       "<button>Save and restart</button></form>"
+      + displaySection() +
       "<p><small>" FW_VERSION ", " BOARD_NAME ". Networks: " + std::to_string(n > 0 ? n : 0) + " found, "
       "<a href=/setup style='color:#8fd'>refresh</a>.</small></p>";
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   return sendText(req, "200 OK", page, "text/html");
 }
 
@@ -520,17 +615,55 @@ static esp_err_t onSetupPost(httpd_req_t *req) {
   ssid.trim();
   if (!ssid.length()) ssid = formArg(body, "pick").c_str();
   if (!ssid.length()) return sendText(req, "400 Bad Request", "Pick or type a Wi-Fi network.\n");
+  // Stored secrets are never echoed into the form, so an empty field means "keep" (same network for the password).
+  std::string pw = formArg(body, "pass");
+  std::string tk = formArg(body, "token");
+  bool sameNet = ssid == settings.wifiSsid;
   settings.wifiSsid = ssid;
-  settings.wifiPass = formArg(body, "pass").c_str();
-  settings.token = formArg(body, "token").c_str();
-  settings.token.trim();
+  if (pw.size() || !sameNet) settings.wifiPass = pw.c_str();
+  if (tk.size()) { settings.token = tk.c_str(); settings.token.trim(); }
   sendText(req, "200 OK",
            "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
            "<body style='font:17px system-ui;margin:24px;background:#1b1f1d;color:#eee'>"
            "<h2>Saved</h2><p>The panel restarts and joins <b>" + htmlEscape(ssid) + "</b>. "
-           "Its status bar shows how that goes.</p>", "text/html");
+           "Its status bar shows how that goes.</p>" + webLoginBox() +
+           "<p>If the screen is blank or garbled, join <b>Twiddle-Setup</b> again and use "
+           "<i>My screen looks wrong</i> on the setup page.</p>", "text/html");
   delay(200);
   uiCall(applySetup, nullptr);
+  return ESP_OK;
+}
+
+static void applyDisplay(void *) { control::stopAndRestart(); }
+
+// POST /display (v=0..4): same access rule as /setup: open while the setup portal is up, the web login otherwise.
+static esp_err_t onDisplayPost(httpd_req_t *req) {
+  if (!wlan::portalActive() && !login(req)) return ESP_OK;
+  if (req->content_len == 0 || req->content_len > 64) return sendText(req, "400 Bad Request", "bad form\n");
+  std::string body(req->content_len, '\0');
+  size_t got = 0;
+  while (got < body.size()) {
+    int n = httpd_req_recv(req, &body[got], body.size() - got);
+    if (n == HTTPD_SOCK_ERR_TIMEOUT) continue;
+    if (n <= 0) return ESP_FAIL;
+    got += n;
+  }
+  std::string v = formArg(body, "v");
+  int n = v.empty() ? -1 : atoi(v.c_str());
+  if (!panelfb::validVariant(n)) return sendText(req, "400 Bad Request", "Pick a display.\n");
+  {
+    UiLock l;
+    settingsSelectPanel(n);
+  }
+  sendText(req, "200 OK",
+           "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+           "<body style='font:17px system-ui;margin:24px;background:#1b1f1d;color:#eee'>"
+           "<h2>Restarting</h2><p>Display: <b>" + htmlEscape(variantLabel(n)) + "</b>.</p>"
+           "<p>If the picture looks right, <b>tap Keep on the panel's screen</b>. Otherwise switch the panel off and on "
+           "three times and it returns to the previous display; then join <b>Twiddle-Setup</b> again to try another.</p>",
+           "text/html");
+  delay(200);
+  uiCall(applyDisplay, nullptr);
   return ESP_OK;
 }
 
@@ -547,12 +680,6 @@ static esp_err_t onNotFound(httpd_req_t *req, httpd_err_code_t) {
 }
 
 void otaBegin() {
-  std::string cred = std::string("ota:") + OTA_SECRET;
-  unsigned char enc[128];
-  size_t el = 0;
-  mbedtls_base64_encode(enc, sizeof enc, &el, (const unsigned char *)cred.data(), cred.size());
-  expectedAuth = "Basic " + std::string((char *)enc, el);
-
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.stack_size = 10240;
   cfg.core_id = 0;  // next to Wi-Fi and the Autoblow task; the UI has core 1 to itself
@@ -574,6 +701,7 @@ void otaBegin() {
       {"/panel", HTTP_GET, onPanel}, {"/pclk", HTTP_GET, onPclk},
       {"/flip", HTTP_GET, onFlip},
       {"/setup", HTTP_GET, onSetupGet},    {"/setup", HTTP_POST, onSetupPost},
+      {"/display", HTTP_POST, onDisplayPost},
   };
   for (const R &r : routes) {
     httpd_uri_t u = {};

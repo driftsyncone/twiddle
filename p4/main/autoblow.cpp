@@ -10,7 +10,7 @@
 #include <string>
 
 #include "log.h"
-#include "secrets.h"
+#include "build_config.h"
 #include "settings.h"
 #include "wlan.h"
 

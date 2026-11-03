@@ -25,3 +25,5 @@ __pycache__/
 .idea/
 .DS_Store
 *~
+tools/release-denylist.local
+build-*/

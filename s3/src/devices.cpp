@@ -4,6 +4,7 @@
 #include <Preferences.h>
 
 #include "ble.h"
+#include "hrm.h"
 #include "settings.h"
 
 namespace devices {
@@ -167,10 +168,16 @@ Info info(int i) {
   in.level = t.level;
   in.rssi = t.rssi;
   strlcpy(in.status, t.status, sizeof in.status);
+  if (t.kind == Kind::Hrm) {  // an input: nothing follows, nothing is scaled
+    in.enabled = false;
+    in.level = 0;
+    in.bpm = t.connected && hrm::ageMs() < 10000 ? hrm::bpm() : 0;
+  }
   return in;
 }
 
 void setEnabled(int i, bool on) {
+  if (i > 0 && ble::toy(i - 1).kind == Kind::Hrm) return;  // an input, nothing to switch
   if (i <= 0) {
     abPrefs.on = on;
     savePrefs("", abPrefs);
@@ -185,6 +192,7 @@ void setEnabled(int i, bool on) {
 
 void setScale(int i, int pct) {
   pct = constrain(pct, 10, 100);
+  if (i > 0 && ble::toy(i - 1).kind == Kind::Hrm) return;
   if (i <= 0) {
     abPrefs.scale = pct;
     savePrefs("", abPrefs);
@@ -255,6 +263,10 @@ void apply(const autoblow::Desired &d) {
   int level = d.want == autoblow::Want::Speed ? d.speed : 0;
   for (int i = 0; i < ble::count(); i++) {
     ble::Toy t = ble::toy(i);
+    if (t.kind == Kind::Hrm) {  // a heart rate monitor never gets output
+      ble::setLevel(i, 0);
+      continue;
+    }
     Prefs pr = loadPrefs(t.addr);
     int l = pr.on && level ? max(1, level * pr.scale / 100) : 0;
     // Only a toy that really runs counts as asked: one held at 0 after a
@@ -285,7 +297,7 @@ void loop() {
   // A Bluetooth toy whose link dropped while it was asked to run.
   for (int i = 0; i < ble::count(); i++) {
     ble::Toy t = ble::toy(i);
-    if (!t.known) continue;
+    if (!t.known || t.kind == Kind::Hrm) continue;  // a monitor dropping out is no loss of output
     Seen &s = seenFor(t.addr);
     // (Re)connected: start counting from here. A forgotten and re-paired toy
     // starts its drops at 0 again, which mustn't read as a loss.
@@ -324,7 +336,7 @@ bool anyMoving() {
   if (abPrefs.on && abMoving(autoblow::status())) return true;
   for (int i = 0; i < ble::count(); i++) {
     ble::Toy t = ble::toy(i);
-    if (t.connected && t.level > 0) return true;
+    if (t.kind != Kind::Hrm && t.connected && t.level > 0) return true;
   }
   return false;
 }

@@ -4,7 +4,7 @@ idf_component_register(SRCS ${SRCS}
                     INCLUDE_DIRS "." "compat"
                     REQUIRES bt esp_hosted esp_lcd esp_driver_gpio esp_driver_i2c esp_driver_ledc esp_mm esp_psram
                              esp_wifi esp_event esp_netif nvs_flash json esp_http_client esp_http_server esp-tls
-                             mbedtls app_update esp_timer esp_adc mdns)
+                             mbedtls app_update esp_timer esp_adc mdns bootloader_support esp_hw_support)
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-error=unused-function -Wno-unused-parameter)
 # esp-nimble-cpp would pull in Arduino String (WString.h) because our shim has <Arduino.h>; we use std::string.
 target_compile_definitions(${COMPONENT_LIB} PRIVATE NIMBLE_CPP_ARDUINO_STRING_AVAILABLE=0)

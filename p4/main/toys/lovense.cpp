@@ -2,7 +2,7 @@
 // TX characteristic, replies as notifications on RX.
 //
 // Protocol details from the Buttplug project, BSD-3-Clause, Copyright (c)
-// 2016-2026 Nonpolynomial Labs, LLC (see THIRD_PARTY_NOTICES.md):
+// 2016-2023 Nonpolynomial Labs, LLC (see THIRD_PARTY_NOTICES.md):
 //   crates/buttplug_server_device_config/device-config/protocols/lovense.yml
 //   crates/buttplug_server/src/device/protocol_impl/lovense/mod.rs,
 //   lovense_max.rs, lovense_rotate_vibrator.rs, lovense_stroker.rs

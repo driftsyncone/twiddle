@@ -42,8 +42,7 @@ static const Palette PALETTES[] = {
 };
 static const int N = sizeof PALETTES / sizeof *PALETTES;
 
-static const int DEFAULT_THEME = 1;  // Midnight; same as Settings::theme default
-static int cur = DEFAULT_THEME;
+static int cur = 0;
 static lv_color_t cache[(int)Role::Count];
 
 int count() { return N; }
@@ -234,7 +233,7 @@ void bind(lv_obj_t *obj, Prop prop, Role role, lv_style_selector_t sel) {
 
 // ---------------------------------------------------------------- switching
 static void select(int idx) {
-  cur = idx >= 0 && idx < N ? idx : DEFAULT_THEME;
+  cur = idx >= 0 && idx < N ? idx : 0;
   const Palette &p = PALETTES[cur];
   for (int i = 0; i < (int)Role::Count; i++) cache[i] = lv_color_hex(p.c[i]);
 }

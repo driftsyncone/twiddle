@@ -5,6 +5,9 @@
 
 #include "autoblow.h"
 #include "devices.h"
+#include "edge.h"
+#include "encscale.h"
+#include "hrm.h"
 #include "settings.h"
 
 namespace control {
@@ -66,11 +69,45 @@ static int apLength, apSurprise;        // see control.h
 static int customPeak[WAVES];           // 0 = planner's choice
 static const uint32_t LENGTH_MS[] = {0, 5 * 60000, 10 * 60000, 20 * 60000, 30 * 60000};
 
+// ---------- HR edging (edge.h) ----------
+// Off by default; when off none of this runs and the Autopilot above is exactly what it was.
+static const int HR_POINTS = 96;                     // = the Autopilot graph's resolution
+static const uint32_t HR_NOMINAL_MS = 30 * 60000;    // graph width when Length is Auto
+static bool apHr;
+static edge::Controller hrCtl;
+static uint32_t hrSeq;
+static uint8_t hrSpd[HR_POINTS], hrBpmHist[HR_POINTS];  // what happened, per graph column
+static int hrEnd;                                    // HrStatus::end
+
 // ---------- local scripts ----------
 static int sSlot = -1;
 static bool sPlaying;
 
 static uint32_t lostSeen;
+
+// ---------- physical encoder (encoder.h) ----------
+// Turning it changes the ACTIVE speed: Remote's manual speed, or Autopilot's live scale (only ever downwards from what the
+// chosen Intensity plans, so it can never exceed what the screen allows). A short press pauses / resumes; a resume ramps back
+// up to the paused speed over RAMP_MS and never jumps.
+static const int ENC_SCALE_MIN = 20;
+static const uint32_t RAMP_MS = 1500;
+static int encScale = 100;             // Autopilot / HR edging: percent of the planned speed
+static Active encPaused = Active::None;  // mode the encoder paused, to resume it
+static bool ramping;
+static uint32_t rampStart;
+
+static int scaled(int s) { return s > 5 ? max(5, s * encScale / 100) : s; }
+
+// During a resume ramp the speed climbs linearly from the 5 % minimum to its value.
+static int shaped(int s) {
+  if (!ramping) return s;
+  uint32_t el = millis() - rampStart;
+  if (el >= RAMP_MS) {
+    ramping = false;
+    return s;
+  }
+  return s > 5 ? 5 + (int)((int64_t)(s - 5) * el / RAMP_MS) : s;
+}
 
 // ---------- desired state ----------
 
@@ -79,11 +116,11 @@ static void push() {
   switch (act) {
     case Active::Remote:
       d.want = Want::Speed;
-      d.speed = finishing ? 100 : rSpeed;
+      d.speed = finishing ? 100 : shaped(rSpeed);
       break;
     case Active::Autopilot:
       d.want = Want::Speed;
-      d.speed = apSpeed;
+      d.speed = shaped(scaled(apSpeed));
       break;
     case Active::Script:
       d.want = Want::Script;
@@ -106,7 +143,10 @@ static void startPulse(uint32_t ms) {
 }
 
 // Leave whatever mode is running.
+static bool apResumable;  // the last thing that happened was an Autopilot pause: Start continues that session
+
 static void leave() {
+  apResumable = false;
   apPlaying = false;
   finishing = false;
   act = Active::None;
@@ -207,12 +247,63 @@ static int apCurrentSpeed() {
   }
 }
 
+static uint32_t hrSessionMs() { return apLength ? LENGTH_MS[apLength] : HR_NOMINAL_MS; }
+
+static edge::Config hrConfig() {
+  edge::Config c;
+  c.floor = LEVELS[apIntensity].floor;
+  c.ceiling = LEVELS[apIntensity].ceiling;
+  c.restingBpm = settings.hrResting;
+  c.edgeBpm = settings.hrEdge;
+  c.recoverDrop = settings.hrDrop;
+  c.maxEdges = settings.hrEdges;
+  c.edgeStep = settings.hrStep;
+  c.riseBpm = settings.hrRise;
+  c.lengthMs = LENGTH_MS[apLength];
+  return c;
+}
+
+static void hrBegin() {
+  uint32_t now = millis();
+  memset(hrSpd, 0, sizeof hrSpd);
+  memset(hrBpmHist, 0, sizeof hrBpmHist);
+  hrEnd = 0;
+  apElapsed = 0;
+  hrCtl.start(hrConfig(), now);
+  hrSeq = hrm::seq();
+  if (hrm::ageMs() < 2000) hrCtl.sample(now, hrm::bpm());  // a reading that is already there
+  apSpeed = hrCtl.out().speed;
+}
+
+// false once the session has ended (everything has been stopped).
+static bool hrTick(uint32_t now) {
+  if (hrm::seq() != hrSeq) {
+    hrSeq = hrm::seq();
+    hrCtl.sample(now, hrm::bpm());
+  }
+  hrCtl.tick(now);
+  edge::Output o = hrCtl.out();
+  int idx = min<uint32_t>(HR_POINTS - 1, (uint64_t)apElapsed * HR_POINTS / hrSessionMs());
+  hrSpd[idx] = o.speed;
+  hrBpmHist[idx] = hrm::ageMs() < 5000 ? o.bpm : 0;
+  if (o.phase == edge::Phase::Done) {
+    hrEnd = (int)o.end;
+    stopAll();
+    return false;
+  }
+  apSpeed = o.speed;
+  return true;
+}
+
 static void autopilotTick() {
   uint32_t now = millis();
   uint32_t dt = now - apLastTick;  // real time, so a stalled loop doesn't stretch the session
   apLastTick = now;
   apPhaseMs += dt;
   apElapsed += dt;
+  if (apHr) {
+    if (!hrTick(now)) return;
+  } else {
   while (apPhaseMs >= phaseLength()) {
     apPhaseMs -= phaseLength();
     apWobbleSlot = -1;
@@ -228,6 +319,7 @@ static void autopilotTick() {
     }
   }
   apSpeed = apCurrentSpeed();
+  }
 
   const Vac &v = AP_VAC[apVac];
   if (v.pulseMs && apElapsed - apLastSuction >= v.intervalMs) {
@@ -242,6 +334,7 @@ static void autopilotTick() {
 static void tick(lv_timer_t *) {
   uint32_t now = millis();
 
+  if (act != Active::None) encPaused = Active::None;  // something else started: nothing left to resume
   if (act == Active::Autopilot && apPlaying) autopilotTick();
 
   if (act == Active::Remote && !finishing) {
@@ -266,6 +359,7 @@ static void tick(lv_timer_t *) {
 }
 
 void begin() {
+  apHr = settings.hrEdging;
   restartSession();  // so the graph shows the coming session before Start
   lv_timer_create(tick, 100, nullptr);
 }
@@ -321,26 +415,35 @@ void looser(bool held) {
 // ---------- autopilot ----------
 
 void autopilotStart() {
+  bool resumed = apResumable;  // read before leave() clears it
   leave();
+  encScale = encscale::onStart(encScale, resumed);  // a lowered scale never carries into a new session or another mode's return
   if (!apPlanned) restartSession();
   act = Active::Autopilot;
   apPlaying = true;
   apLastTick = millis();  // resume where it paused, without the pause counting
-  apSpeed = apCurrentSpeed();
+  if (apHr) hrBegin();
+  else apSpeed = apCurrentSpeed();
   push();
 }
 
 void autopilotPause() {
-  if (act == Active::Autopilot) leave();
+  if (act == Active::Autopilot) {
+    leave();
+    apResumable = true;
+  }
   push();
 }
+
+static void hrApply() { hrCtl.reconfigure(hrConfig()); }
 
 // Changing a setting re-plans the waves but keeps the place in the session.
 static void replan() {
   uint32_t done = apElapsed;
   plan();
   apElapsed = min(done, sessionMs);
-  if (act == Active::Autopilot) {
+  if (apHr) hrApply();
+  if (act == Active::Autopilot && !apHr) {
     apSpeed = apCurrentSpeed();
     push();
   }
@@ -355,7 +458,7 @@ void autopilotSetVacuum(int l) {
 int autopilotIntensity() { return apIntensity; }
 int autopilotEdge() { return apEdge; }
 int autopilotVacuum() { return apVac; }
-int autopilotSpeed() { return act == Active::Autopilot ? apSpeed : 0; }
+int autopilotSpeed() { return act == Active::Autopilot ? scaled(apSpeed) : 0; }
 int autopilotProgress() {
   if (!apPlanned || !sessionMs) return 0;
   return min<uint32_t>(100, (uint64_t)apElapsed * 100 / sessionMs);
@@ -369,6 +472,7 @@ int autopilotLength() { return apLength; }
 int autopilotSurprise() { return apSurprise; }
 
 static void applyNow() {
+  if (apHr) return;  // the edge controller owns the speed
   apWobbleSlot = -1;
   if (act == Active::Autopilot) {
     apSpeed = apCurrentSpeed();
@@ -377,6 +481,7 @@ static void applyNow() {
 }
 
 void autopilotMore() {
+  if (apHr) return;
   if (!apPlanned) restartSession();
   Wave &w = waves[apWave];
   if (apPhase == Phase::Climb) {  // to the peak now
@@ -397,6 +502,14 @@ void autopilotMore() {
 }
 
 void autopilotBackOff() {
+  if (apHr) {
+    hrCtl.backOff(millis());
+    if (act == Active::Autopilot) {
+      apSpeed = hrCtl.out().speed;
+      push();
+    }
+    return;
+  }
   if (!apPlanned) restartSession();
   Wave &w = waves[apWave];
   if (apPhase == Phase::Rest) {  // rest longer
@@ -411,6 +524,7 @@ void autopilotBackOff() {
 }
 
 int autopilotSpeedAt(uint32_t t) {
+  if (apHr) return t <= apElapsed ? hrSpd[min<uint32_t>(HR_POINTS - 1, (uint64_t)t * HR_POINTS / hrSessionMs())] : 0;
   if (!apPlanned) return 0;
   const Level &lv = LEVELS[apIntensity];
   int wave;
@@ -425,11 +539,11 @@ int autopilotSpeedAt(uint32_t t) {
   return constrain(phase == Phase::Hold ? w.peak : lv.floor, 5, 100);
 }
 
-uint32_t autopilotSessionMs() { return apPlanned ? sessionMs : 0; }
+uint32_t autopilotSessionMs() { return apHr ? hrSessionMs() : apPlanned ? sessionMs : 0; }
 uint32_t autopilotElapsedMs() { return apPlanned ? apElapsed : 0; }
 
 uint32_t autopilotNextPeakMs() {
-  if (!apPlanned) return 0;
+  if (apHr || !apPlanned) return 0;
   const Wave &w = waves[apWave];
   if (apPhase == Phase::Climb) return w.climbMs - apPhaseMs;
   if (apPhase == Phase::Hold) return 0;
@@ -447,6 +561,7 @@ int autopilotWaveAt(uint32_t t) {
 }
 
 void autopilotSeek(uint32_t t) {
+  if (apHr) return;
   if (!apPlanned) restartSession();
   t = min(t, sessionMs ? sessionMs - 1 : 0);
   locate(t, apWave, apPhase, apPhaseMs);
@@ -467,6 +582,43 @@ void autopilotClearPeaks() {
   for (int &p : customPeak) p = 0;
   replan();
 }
+// ---------- HR edging ----------
+
+void autopilotSetHrEdging(bool on) {
+  if (on == apHr) return;
+  if (act == Active::Autopilot) leave();  // never switch the generator under a running session
+  apHr = on;
+  settings.hrEdging = on;
+  settingsSaveHr();
+  push();
+}
+bool autopilotHrEdging() { return apHr; }
+void autopilotHrApply() { hrApply(); }
+
+void autopilotHrLearnEdge() {
+  if (!hrm::connected() || hrm::ageMs() > 5000 || !hrm::bpm()) return;
+  settings.hrEdge = constrain(hrm::bpm(), settings.hrResting + 10, 200);
+  settingsSaveHr();
+  hrApply();
+}
+
+HrStatus autopilotHrStatus() {
+  edge::Output o = hrCtl.out();
+  HrStatus h = {};
+  h.phase = o.phase == edge::Phase::Idle ? -1 : (int)o.phase - 1;
+  h.edges = o.edges;
+  h.maxEdges = settings.hrEdges;
+  h.edgeBpm = o.phase == edge::Phase::Idle ? settings.hrEdge : o.edgeBpm;
+  h.bpm = hrm::connected() && hrm::ageMs() < 5000 ? hrm::bpm() : 0;
+  h.end = hrEnd;
+  return h;
+}
+
+int autopilotHrBpmAt(uint32_t t) {
+  if (!apHr || t > apElapsed) return 0;
+  return hrBpmHist[min<uint32_t>(HR_POINTS - 1, (uint64_t)t * HR_POINTS / hrSessionMs())];
+}
+
 void autopilotSaveFavourite(int slot) {
   if (slot < 0 || slot >= Settings::FAVOURITES) return;
   if (!apPlanned) restartSession();
@@ -509,10 +661,59 @@ void scriptToggle() {
 int scriptSlot() { return act == Active::Script ? sSlot : -1; }
 bool scriptPlaying() { return act == Active::Script && sPlaying; }
 
+// ---------- encoder ----------
+
+bool encoderAdjust(int pct) {
+  if (pct == 0) return false;
+  if (act == Active::Remote && !finishing) {
+    rSpeed = constrain(rSpeed + pct, 5, 100);
+    push();
+    return true;
+  }
+  if (act == Active::Autopilot) {
+    encScale = constrain(encScale + pct, ENC_SCALE_MIN, 100);
+    push();
+    return true;
+  }
+  return false;  // Scripts run on the device: no speed to scale. Paused / stopped: nothing to change.
+}
+
+bool encoderPaused() { return encPaused != Active::None; }
+
+bool encoderTogglePause() {
+  if (act == Active::Script) {
+    scriptToggle();
+    return true;
+  }
+  if (act == Active::Remote && !finishing) {
+    remotePause();
+    encPaused = Active::Remote;
+    return true;
+  }
+  if (act == Active::Autopilot) {
+    autopilotPause();
+    encPaused = Active::Autopilot;
+    return true;
+  }
+  if (act == Active::None && encPaused != Active::None) {
+    Active m = encPaused;
+    encPaused = Active::None;
+    rampStart = millis();
+    ramping = true;
+    if (m == Active::Remote) remoteStart();
+    else autopilotStart();
+    return true;
+  }
+  return false;
+}
+
 // ---------- stop ----------
 
 void stopAll() {
   leave();
+  encPaused = Active::None;  // a hard stop is final: the encoder button can't resume it
+  encScale = 100;
+  ramping = false;
   plusHeld = minusHeld = false;
   push();
   devices::stopNow();

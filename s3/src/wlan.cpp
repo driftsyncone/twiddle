@@ -7,7 +7,7 @@
 
 #include "ble.h"
 #include "log.h"
-#include "secrets.h"
+#include "build_config.h"
 #include "settings.h"
 
 namespace wlan {
@@ -87,7 +87,7 @@ void begin() {
     WiFi.mode(WIFI_AP_STA);  // STA stays up so the portal page can scan
     WiFi.softAP(PORTAL_SSID, PORTAL_PASS);
     WiFi.scanNetworks(true);
-    Serial.printf("setup portal: join %s / %s, open http://%s/\n", PORTAL_SSID, PORTAL_PASS,
+    Serial.printf("setup portal: join %s / %s, open http://%s/setup\n", PORTAL_SSID, PORTAL_PASS,
                   WiFi.softAPIP().toString().c_str());
   }
 }
@@ -181,7 +181,7 @@ Info info() {
   if (i.up) {
     i.problem = "";
   } else if (portal) {
-    i.problem = "setup: join Wi-Fi Twiddle-Setup (pw twiddle-setup), open 192.168.4.1";
+    i.problem = "setup: join Wi-Fi Twiddle-Setup (pw twiddle-setup), open 192.168.4.1/setup";
   } else if (!settings.wifiSsid.length()) {
     i.problem = "not set up";
     i.fixable = true;

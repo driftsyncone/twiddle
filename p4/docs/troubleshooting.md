@@ -18,7 +18,7 @@
 |---|---|---|
 | Panel dark, log says it reached the UI | wrong LCD reset pin or init table | V2 panel: reset GPIO0, V2 table ([hardware.md](hardware.md)) |
 | Washed-out colours **and** the picture shifts | the original-panel table on a V2 panel | `GET /panel?v=0` (V2), restart |
-| Screen black, backlight on (maybe a faint white glow at the edges), `/screenshot` shows the UI | a different panel behind the driver (`_Y` "new panel") or a DCS register read | `GET /panel?v=4`, restart ([hardware.md](hardware.md)); never read panel registers back on the `_Y` |
+| Screen black, backlight on (maybe a faint white glow at the edges), `/screenshot` shows the UI | a different panel behind the driver (variant 4 is the alternative `_Y` table; V2 works on most units we tried) or a DCS register read | `GET /panel?v=4`, restart ([hardware.md](hardware.md)); never read panel registers back on the `_Y` |
 | Picture visible but dim, banded or **shaky** | pixel clock too high for this panel | `GET /pclk?mhz=48` (default on `_Y`), restart; step 4 MHz at a time |
 | White screen, `dsi.dpi ... underrun happens` | PSRAM at 20 MHz | `CONFIG_IDF_EXPERIMENTAL_FEATURES=y` + `CONFIG_SPIRAM_SPEED_200M=y`; boot log must show `Speed: 200MHz` |
 | Blue flashes / blue strip at the bottom while the UI redraws, wobbling picture | same: DPI refresh starved by slow PSRAM | same fix; underruns only show in the log during activity, an idle log looks clean |
@@ -52,7 +52,7 @@
 | `firmware:` never `pending`/rollback does nothing | `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` off | keep it in `sdkconfig.defaults` |
 | Panel returns to the old firmware after an update | new image crashed or had no Wi-Fi for 30 s | read the log of the failed boot; fix; try again |
 | `ota.sh` says `ROLLED BACK (or the same image ...)` | rollback, or the same binary was uploaded | check `firmware:` and `id:` on `GET /` |
-| `curl` to `/update` returns `login required` (401) | wrong `OTA_PASSWORD`, or none compiled in (then every login fails) | set `OTA_PASSWORD` in `main/secrets.h` and flash that build once over USB |
+| `curl` to `/update` returns `login required` (401) or `web admin is locked` (403) | 401: wrong web password (5 wrong ones in a row lock the login for 60 s: 429). 403: the panel has no web password (could not be made or stored) | read the password on the panel's Settings tab ("Web login", user `ota`; tap to reset); a dev build can fix one with `OTA_PASSWORD` in `main/secrets.h`; for 403 restart the panel, then erase and re-flash if it persists |
 | `/update` answers 500 `image rejected: ...`, `flash write failed`, `upload stalled`, `connection lost during upload` | bad or truncated image / unreliable Wi-Fi link | upload again; the old firmware keeps running, but the session and devices were stopped when the upload started |
 | `/screenshot` answers 500 `no frame buffer` | called before `boardBegin()` finished, or a build that uses the old RGB565 accessor (`boardFrameBuffer()` is always `nullptr` on the P4; fixed in 2.0.0-p4.4) | use `boardFrameBufferRgb888()` and wait for the boot to finish |
 | `/theme` answers `no such theme` | index out of range | `GET /theme` lists the valid ones |

@@ -89,7 +89,7 @@ struct Ctx {
 };
 
 struct Driver {
-  char id;              // stored in NVS: 'L' Lovense, 'K' Keon, '2' Keon 2 / Keon WiFi, 'O' OSSM
+  char id;              // stored in NVS: 'L' Lovense, 'K' Keon, '2' Keon 2 / Keon WiFi, 'O' OSSM, 'H' heart rate monitor
   devices::Kind kind;
   const char *brand;    // for logs
   // An advertisement from a scan: one of ours?
@@ -107,7 +107,7 @@ struct Driver {
   void (*battery)(Ctx &c);
 };
 
-extern const Driver lovense, keon, keon2, ossm;
+extern const Driver lovense, keon, keon2, ossm, hrmDriver;  // hrmDriver: a heart rate monitor, not a toy
 
 // The driver whose toys look like `adv`, or nullptr.
 const Driver *match(const NimBLEAdvertisedDevice &adv);

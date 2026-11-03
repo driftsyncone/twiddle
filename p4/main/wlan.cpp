@@ -13,7 +13,7 @@
 
 #include "ble.h"
 #include "log.h"
-#include "secrets.h"
+#include "build_config.h"
 #include "settings.h"
 
 namespace wlan {
@@ -260,7 +260,7 @@ void begin() {
   lastAttempt = millis();
   if (portal) {
     xTaskCreatePinnedToCore(dnsTask, "dns", 3072, nullptr, 2, nullptr, 0);
-    plog("setup portal: join %s / %s, open http://%s/\n", PORTAL_SSID, PORTAL_PASS, portalIp().c_str());
+    plog("setup portal: join %s / %s, open http://%s/setup\n", PORTAL_SSID, PORTAL_PASS, portalIp().c_str());
   } else {
     plog("Wi-Fi: joining '%s'\n", settings.wifiSsid.c_str());
   }
@@ -376,7 +376,7 @@ Info info() {
     i.rssi = rssi;
     portEXIT_CRITICAL(&sampleMux);
   } else if (portal) {
-    snprintf(i.problem, sizeof i.problem, "setup: join Wi-Fi %s (pw %s), open 192.168.4.1", PORTAL_SSID, PORTAL_PASS);
+    snprintf(i.problem, sizeof i.problem, "setup: join Wi-Fi %s (pw %s), open 192.168.4.1/setup", PORTAL_SSID, PORTAL_PASS);
   } else if (!haveSsid) {
     snprintf(i.problem, sizeof i.problem, "not set up");
     i.fixable = true;

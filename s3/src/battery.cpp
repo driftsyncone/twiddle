@@ -4,6 +4,8 @@
 #include <Wire.h>
 
 #include "board.h"
+#include "encoder.h"
+#include "p4bus.h"
 
 namespace battery {
 
@@ -11,7 +13,7 @@ static const uint8_t ADDR = 0x36;
 static const uint8_t REG_VCELL = 0x02, REG_SOC = 0x04, REG_VERSION = 0x08, REG_CRATE = 0x16;
 
 static TwoWire *bus = nullptr;  // where the gauge answered, or null
-static bool p4Started, p4Probed;
+static bool p4Probed;  // p4bus.h owns the Wire1 start/stop
 static Info cur;
 static uint32_t lastRead, lastProbe;
 
@@ -34,10 +36,7 @@ static float percentFromVolts(float v) {
 }
 
 static void adcBegin() {
-  if (p4Started) {
-    Wire1.end();  // no gauge on P4: the pin goes to the ADC
-    p4Started = false;
-  }
+  p4bus::end();  // no gauge on P4: the pin goes to the ADC (never reached while the encoder owns the pins)
   pinMode(BOARD_BATTERY_ADC_PIN, INPUT);
   analogSetPinAttenuation(BOARD_BATTERY_ADC_PIN, ADC_11db);  // 12 dB: up to ~3.1 V (4.2 V cell -> 3.16 V)
   adcReady = true;
@@ -102,12 +101,13 @@ static void probe() {
     bus = &Wire;
   } else if (BOARD_HAS_P4_I2C && !p4Probed) {
     p4Probed = true;  // boot only: GPIO17 is the battery ADC afterwards
-    if (!p4Started) p4Started = Wire1.begin(17, 18, 100000);
-    if (p4Started && present(Wire1)) bus = &Wire1;
+    // The rotary encoder (encoder.h) also answers at 0x36 by default: a seesaw is not a gauge.
+    if (p4bus::begin() && present(Wire1) && !encoder::isEncoderAt(ADDR)) bus = &Wire1;
+    else if (!encoder::ownsP4()) p4bus::end();
   }
   if (!bus) {
 #if BOARD_BATTERY_ADC_PIN >= 0
-    if (!adcReady) adcBegin();
+    if (!adcReady && !encoder::ownsP4()) adcBegin();  // GPIO17 is the encoder's SDA when it owns the P4 pins
 #endif
     return;
   }

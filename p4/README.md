@@ -8,15 +8,14 @@ or hub is needed once it is set up.
 This is the ESP-IDF 5.5 port of the Arduino/ESP32-S3 Twiddle firmware (in [`../s3`](../s3)). The Arduino firmware for the
 smaller ESP32-S3 panels lives in that folder; see [docs/other-panels.md](docs/other-panels.md).
 
-> **Unofficial community project.** Not made, endorsed or supported by Autoblow. "Autoblow" and "VacuGlide" are
-> trademarks of their owners. Use it at your own risk (see [Disclaimer](#disclaimer)).
+> **Unofficial project, provided as is, with no warranty or guarantee of any kind.** Everything here is unofficial. It is not made, endorsed or supported by Autoblow, Lovense, Kiiroo, Research & Desire, or any product or company named Twiddle, and is not affiliated with them. Names are used only to describe compatibility. Use it at your own risk; see [Disclaimer and safety](#disclaimer-and-safety).
 
 ## Supported hardware
 
 | Part | What |
 |---|---|
 | Board | Guition **JC1060P470C**: ESP32-P4 (chip rev v1.3 tested), 16 MB flash, PSRAM, ESP32-C6 coprocessor |
-| Display | 7" 1024x600, MIPI-DSI, JD9165 controller. The board is sold with different panel batches: **V2** (default) and the newer **`_Y`** ("new panel", model `JC1060P470C_I_W_Y`) are supported and verified; pick yours with the per-unit `panel` setting ([docs/hardware.md](docs/hardware.md)). The original batch is implemented from ESPHome's values but untested |
+| Display | 7" 1024x600, MIPI-DSI, JD9165 controller. The board is sold with two panel variants; this firmware is for the **V2** panel (2026 batch). The original variant needs a different init table and timings and is **not supported** |
 | Touch | GT911 capacitive |
 | Radio | Wi-Fi and Bluetooth LE through the ESP32-C6 over SDIO (esp_hosted) |
 
@@ -31,7 +30,7 @@ Other boards are not supported. Pins and board notes: [docs/hardware.md](docs/ha
   length and peak order, steering buttons (More, Back off, **Finish Me**), a graph you can tap to jump or draw on,
   and three favourite sessions.
 - **Scripts**: play any of the device's 30 local-script slots, with names you give them (stored on the panel).
-- **Devices**: the Autoblow device plus Bluetooth toys (Lovense, Kiiroo Keon, OSSM drivers). Scan, Connect,
+- **Devices**: the Autoblow device plus Bluetooth toys (Lovense, Kiiroo Keon, OSSM drivers) and a standard BLE heart rate monitor (an input, not a toy; see HR edging below). Scan, Connect,
   Follow with a per-device scale; remembered toys reconnect by themselves.
 - **STOP** on every screen, and a connection-loss safety behaviour (see below).
 - **Settings**: Wi-Fi with network scan, device token, screen sleep, brightness, Wi-Fi gap tolerance, Bluetooth
@@ -43,6 +42,9 @@ Other boards are not supported. Pins and board notes: [docs/hardware.md](docs/ha
 - Network name `twiddle-p4.local` by default (`PANEL_HOSTNAME` in `secrets.h` changes it; the S3 firmware uses `twiddle-s3`).
 - A small web server for status, log, screenshots and diagnostics ([docs/architecture.md](docs/architecture.md)).
 
+The P4 board's Wi-Fi and Bluetooth radio is a separate ESP32-C6 with its own firmware, which the web flasher does not install;
+factory C6 firmware can be too old to join Wi-Fi. See [docs/c6-firmware.md](docs/c6-firmware.md).
+
 The user documentation is in [docs/user-guide.md](docs/user-guide.md) and [docs/settings.md](docs/settings.md).
 
 ## Status
@@ -51,17 +53,32 @@ Working and tested on the board: display and touch, the six tabs, Wi-Fi through 
 (tested against an emulator of the cloud API), Bluetooth scanning, firmware update over Wi-Fi with rollback, themes
 (checked by screenshot).
 
+**HR edging** (Session tab, Autopilot option, off by default): pair a standard BLE heart rate monitor (Heart Rate Service
+0x180D, Measurement 0x2A37; 8- and 16-bit bpm, sensor contact flag, 40 to 220 bpm accepted) on the Devices tab and Autopilot
+edges by your heart rate instead of the planned waves: it climbs like the plain Autopilot, EDGES when the bpm reaches the
+edge bpm or rises by the Fast rise amount within 10 s, drops to the level floor and rests until the bpm is down by the
+recovery drop (and a minimum rest), then raises the edge bpm a little and climbs again. It ends after N edges or the Length
+setting, and stops (floor first) when the signal is lost for more than 5 s. The speed never exceeds the Intensity level's
+ceiling. The monitor takes no output. It shares the **3 Bluetooth links** with the toys (first come, first served; if all 3
+are in use it reads "No free Bluetooth link: disconnect a toy first" and no toy is dropped). Recommended for testing: Polar H10
+(enable "two BLE devices" once in the Polar app). The generator is our own; no pattern numbers from Autoblow's site.
+
 **Not verified yet** (implemented, but not confirmed on hardware):
 
 - use by finger on the real screen over a longer period;
 - commanding a real VacuGlide (all testing so far used an emulator);
+- **HR edging** and the heart rate monitor client (`edge.h`, `toys/hrm.cpp`, firmware 2.0.0-p4.11): build and host-test verified only (`test/host/run.sh`: 52 edge/decoder checks); no board was flashed and no real monitor (the Polar H10 is the recommended one) has been used;
 - any Bluetooth toy (the drivers pass the offline encoder tests in `test/host/`, no real toy has been used);
 - the Settings tab visually, and the setup portal from a phone;
+- the **release prerequisites** (release build, per-device web password, the portal Display select with the Keep/revert
+  fallback, the chip-revision line; branch `release-prep`, 2.0.0-p4.12): build and host-test verified only, no board flashed;
 - a battery fuel gauge (the board has none; the code looks for a MAX17048/MAX17043 on the touch I2C bus).
 
 **Known limits:** the **Flip** button is greyed and reads "Flip: n/a" on this board (the DSI panel does not support it in this
 firmware). The Autopilot settings (Intensity, Edge and so on) are not saved across restarts; favourites, script
 names and the Settings tab values are. The bring-up history and lessons are in [docs/history.md](docs/history.md).
+
+**Rotary encoder (not implemented on the P4 yet).** The S3 firmware has an optional Adafruit 5880 rotary encoder for speed (turn = speed, press = pause/resume, hold = STOP; work in progress there, untested on hardware). It is not on the P4 yet: the 7" board's rear I2C connector pins are not confirmed from the schematic (community reports say it shares the touch bus GPIO7/GPIO8, and one report has SDA/SCL swapped), and the encoder's default address 0x36 is already taken on that bus. See [docs/feature-matrix.md](docs/feature-matrix.md).
 
 ## Safety
 
@@ -87,8 +104,11 @@ idf.py build
 idf.py -p /dev/ttyACM0 flash
 ```
 
-`main/secrets.h` is ignored by git and holds the defaults baked into your build (Wi-Fi, device token, update
-password). Leave `WIFI_SSID` empty to get the setup portal on first boot. Full steps, including installing
+`main/secrets.h` is ignored by git and holds the defaults baked into your build (Wi-Fi, device token, optionally a fixed
+update password). Leave `WIFI_SSID` empty to get the setup portal on first boot. For an image to give to other people
+build with `idf.py -DTWIDDLE_RELEASE=ON build`: nothing of yours is compiled in (`tools/check-release-image.sh` verifies it),
+Wi-Fi is asked for on the panel's own screen at first start (the token and toys are set on the Settings and Devices tabs); the display type is chosen on the `Twiddle-Setup` portal (the phone page is also a fallback for Wi-Fi and token), and the panel makes its own random web password
+(shown only on the panel's Settings tab, never on a web page; user `ota`, used by `ota.sh`). Full steps, including installing
 ESP-IDF and reading the serial log: [docs/dev-setup.md](docs/dev-setup.md). Per-board flashing and backup:
 [docs/flashing.md](docs/flashing.md). After the first flash, later builds can be sent over Wi-Fi with
 `./ota.sh` ([docs/ota-and-rollback.md](docs/ota-and-rollback.md)).
@@ -112,6 +132,10 @@ The project's own code is licensed under **CC BY-NC-SA 4.0** (see [LICENSE](LICE
 it derives from. Third-party components keep their own licences; see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
+For the full picture see [LICENSE-NOTES.md](LICENSE-NOTES.md) (DRAFT, not read by a lawyer): Twiddle's own code stays under CC BY-NC-SA 4.0,
+the third-party components keep their own licences (the generated notices page for each released version lists them with the full texts),
+and the ESP32-P4 image links no GPL or LGPL component, so the LGPL additional permission in that file is not needed for it.
+
 ## Credits
 
 - Built on the [Autoblow](https://developers.autoblow.com/) public device API (no Autoblow code or patterns are
@@ -122,9 +146,19 @@ it derives from. Third-party components keep their own licences; see
 - Bluetooth toy protocols follow the [Buttplug](https://github.com/buttplugio/buttplug) project's device
   definitions.
 
-## Disclaimer
+## Feature requests and bug reports
 
-This is an unofficial hobby project provided as is, with no warranty. It controls a connected device over the internet:
-you are responsible for how you use it, for the safety of whoever uses the device, and for complying with the
-terms of the services and the laws that apply to you. The authors are not affiliated with Autoblow, Guition,
-Espressif, Lovense, Kiiroo or any other brand named here.
+Use [GitHub Issues](https://github.com/driftsyncone/twiddle/issues), one issue per request or bug. Say which board and firmware version you have, what you expected and what happened, and attach logs only after removing tokens and Wi-Fi passwords. Requests are welcome, but there is no promise of a reply, a timeline or support, in line with the unofficial, no-warranty notice at the top. Do not put secrets in a report, security-related ones included.
+
+## Disclaimer and safety
+
+- Unofficial hobby project, provided as is, with no warranty. Use it at your own risk; the authors are not liable for damage or injury, to
+  the extent the law allows.
+- For adults only, and only with the consent of everyone involved.
+- It is not a medical device. Any heart-rate or "edging" feature is not a monitoring or medical function; do not rely on it for health.
+- Software, Wi-Fi, Bluetooth and cloud links can fail. Always keep a way to stop the device that you can reach by hand (its own power
+  switch or stop control), and do not leave a running session unattended.
+- You are responsible for how you use it, for the settings you choose and for following the terms of the services and the laws that
+  apply to you.
+- Vendor and product names (Autoblow, VacuGlide, Guition, Espressif, Lovense, Kiiroo and others) are used only to describe compatibility.
+  The authors are not affiliated with them, and they have not endorsed this project.

@@ -60,9 +60,9 @@ static const int PIN_SDA = 19, PIN_SCL = 20;
 static const int PIN_HSYNC = 39, PIN_VSYNC = 41, PIN_DE = 40, PIN_PCLK = 42;
 // RGB565 bus order: B0..B4, G0..G5, R0..R4.
 static const int DATA_PINS[16] = {8, 3, 46, 9, 1, 5, 6, 7, 15, 16, 4, 45, 48, 47, 21, 14};
-// Pixel clock: settings.pclkMHz (NVS "pclk", default 14, read at boot). Guition units differ: the first one
-// needs 14 (16 garbles it under PSRAM load, 12 gives the panel's RGB self-test), a later one (MAC ...87:08) shows
-// the self-test at 14 and needs 16, the value the ESPHome config uses. Set it with GET /pclk?mhz=N (login), restart.
+// Pixel clock: settings.pclkMHz (NVS "pclk", default 16, read at boot; a saved value is kept). Guition units differ: most
+// need 16 (the value ESPHome and the vendor demo use; a unit that needs it shows the panel's RGB self-test at 14), the
+// first unit (MAC ...80:c4) needs 14 (16 garbles it under PSRAM load, 12 gives the self-test). Set it with GET /pclk?mhz=N (login), restart.
 
 static int level = 100;  // brightness while on
 
@@ -181,8 +181,17 @@ const uint16_t *boardFrameBuffer() {
 
 // ---------- display ----------
 
+#ifdef UI_TRACE
+uint32_t traceFlushUs, traceFlushes, traceFlushPx;  // read and cleared by main.cpp's trace line
+#endif
 static void flushCb(lv_display_t *disp, const lv_area_t *a, uint8_t *px) {
+#ifdef UI_TRACE
+  uint32_t t0 = micros();
+#endif
   esp_lcd_panel_draw_bitmap(panel, a->x1, a->y1, a->x2 + 1, a->y2 + 1, px);
+#ifdef UI_TRACE
+  traceFlushUs += micros() - t0; traceFlushes++; traceFlushPx += (a->x2 - a->x1 + 1) * (a->y2 - a->y1 + 1);
+#endif
   lv_display_flush_ready(disp);
 }
 
@@ -262,7 +271,20 @@ static void touchCb(lv_indev_t *, lv_indev_data_t *data) {
   static bool pressed;
   static bool swallow;  // the touch that woke the screen, until the finger lifts
   uint8_t st;
+#ifdef UI_TRACE
+  static uint32_t tn, tsum, tmax, tlast;
+  uint32_t t0 = micros();
+  bool got = gtRead(0x814E, &st, 1);
+  uint32_t d = micros() - t0;
+  tn++; tsum += d; if (d > tmax) tmax = d;
+  if (millis() - tlast >= 2000) {
+    Serial.printf("uitrace: touch read x%u avg %.2f ms max %.2f ms\n", (unsigned)tn, tsum / 1000.0f / tn, tmax / 1000.0f);
+    tn = tsum = tmax = 0; tlast = millis();
+  }
+  if (got && (st & 0x80)) {
+#else
   if (gtRead(0x814E, &st, 1) && (st & 0x80)) {
+#endif
     pressed = false;
     uint8_t p[8];
     if ((st & 0x0F) > 0 && gtRead(0x814F, p, 8)) {

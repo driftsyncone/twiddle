@@ -23,7 +23,12 @@
 // characteristic that is being deleted. Order: svcMtx before mtx. Nobody holds
 // mtx across a NimBLE call.
 //
-// NimBLE allows 3 links (CONFIG_BT_NIMBLE_MAX_CONNECTIONS). The 3 client
+// NimBLE allows 3 links (CONFIG_BT_NIMBLE_MAX_CONNECTIONS), shared by the toys and the heart rate
+// monitor (toys/hrm.cpp, a Kind::Hrm "toy" that is only an input). First come, first served: nothing
+// is preempted, so with 3 devices up another cannot connect until the user forgets one (Forget
+// disconnects); the status then reads "No free Bluetooth link: disconnect a toy first" and no toy is
+// ever dropped silently; a monitor that is up keeps its link like any other. The retry loop only
+// uses a link that is free at that moment. The 3 client
 // objects are made once and lent to whichever toy connects; they're never
 // deleted. A link is only handed back once its client is disconnected, and
 // its services (with the notify callbacks pointing at the old toy's Ctx) are
@@ -42,13 +47,16 @@
 namespace ble {
 
 static const int MAX_TOYS = 8;
-static const int MAX_LINKS = 3;
+static const int MAX_LINKS = 3;  // decided: 3 Bluetooth devices in total is enough; do not raise the NimBLE limit
 static const uint32_t CONNECT_TIMEOUT_MS = 4000;
 // A remembered toy that isn't there (switched off, away): try again after 15 s,
 // then 30, 60 and every 120 s. Each try listens for it for CONNECT_TIMEOUT_MS,
 // and that listening takes the shared radio away from Wi-Fi.
 static const uint32_t RETRY_MS = 15000;
 static const uint32_t RETRY_MAX_MS = 120000;
+// A remembered heart rate monitor is the thing you are waiting for (a strap advertises about once a second, and a 4 s try
+// at 25 % radio time catches it only ~1 time in 5): it backs off to 30 s, not 120. 3 % of the radio, Wi-Fi unaffected.
+static const uint32_t HR_RETRY_MAX_MS = 30000;
 // Radio time while connecting / scanning (0.625 ms units for the connect,
 // ms for the scan): a quarter / half of the time, so Wi-Fi keeps the rest.
 // NimBLE's defaults listen 100 % of the time.
@@ -530,7 +538,8 @@ static void handleClosing() {
       s.retryMs = 2000;
     } else {  // nothing answered: wait longer each time
       if (s.fails < 8) s.fails++;
-      s.retryMs = min<uint32_t>(RETRY_MS << min<int>(s.fails - 1, 3), RETRY_MAX_MS);
+      s.retryMs = min<uint32_t>(RETRY_MS << min<int>(s.fails - 1, 3),
+                             (s.caps & devices::CAP_HR) ? HR_RETRY_MAX_MS : RETRY_MAX_MS);
       if (s.known) plog("ble: %s not found, next try in %u s\n", s.name, (unsigned)(s.retryMs / 1000));
     }
   }
@@ -594,7 +603,7 @@ static void startConnects() {
         s.connectReq = false;
         if (s.st != St::Idle) continue;
         if (link < 0) {
-          strcpy(s.status, "Too many toys connected (max 3)");
+          strcpy(s.status, "No free Bluetooth link: disconnect a toy first");
           continue;
         }
         pick = &s;
@@ -771,7 +780,8 @@ Toy toy(int i) {
   t.kind = s.drv->kind;
   strlcpy(t.name, s.name, sizeof t.name);
   strlcpy(t.addr, s.addr, sizeof t.addr);
-  t.caps = s.caps;
+  // A heart rate monitor is an input from the first draw: the driver says so before any link (advert / NVS).
+  t.caps = s.caps | (t.kind == devices::Kind::Hrm ? devices::CAP_HR : 0);
   t.known = s.known;
   t.connected = s.st == St::Up;
   t.connecting = s.st == St::Connecting || s.st == St::Linked || s.connectReq;
@@ -823,6 +833,9 @@ void connect(int i) {
     Slot &s = slots[order[i]];
     if (s.st != St::Idle) return;
     s.connectReq = true;
+    // A manual Connect tries at once and restarts the automatic backoff.
+    s.fails = 0;
+    s.retryMs = RETRY_MS;
     strcpy(s.status, "Connecting...");
   }
   wakeWorker();

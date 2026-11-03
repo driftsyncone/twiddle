@@ -21,11 +21,25 @@ struct Settings {
   // Display panel variant behind the JD9165 driver (P4): 0 = V2 (2026 batch, default), 1 = original. A wrong
   // choice leaves the screen black or washed out; read at boot, set over the web (GET /panel).
   int panelVariant = 0;
+  // A variant chosen on the setup portal (or /panel) is on TRIAL until "Keep" is tapped on the panel's screen; after
+  // panelfb::TRIAL_BOOTS unconfirmed boots the next boot goes back to panelPrev (see panelfb.h). Read at boot.
+  int panelPrev = 0;            // last confirmed variant
+  bool panelTrial = false;      // the current variant is not confirmed yet
+  int panelBoots = 0;           // boots spent in this trial
+  int panelRevertedFrom = -1;   // >= 0: this boot just went back from that unconfirmed variant (the UI says so once)
   int pclkMhz = 0;  // display pixel clock override in MHz, 0 = the variant default (52, 48 on the "_Y" panel)
   int graceS = 20;  // 10, 20 or 30
   // Bluetooth toys: -1 = auto (on if a toy is remembered), 0 = off, 1 = on.
   // Off lets Wi-Fi run without modem sleep. Read at boot only.
   int bluetooth = -1;
+  // Heart-rate edging (Autopilot option, edge.h). Off by default.
+  bool hrEdging = false;
+  int hrResting = 70;   // resting bpm, 40..150
+  int hrEdge = 120;     // edge trigger bpm, resting+10 .. 200
+  int hrDrop = 15;      // rest until bpm <= edge - this, 3..60
+  int hrEdges = 5;      // session ends after this many edges, 0 = no limit
+  int hrStep = 2;       // edge bpm goes up by this after each finished cycle, 0..10
+  int hrRise = 20;      // fast-rise trigger: bpm gained within 10 s, 0 = off
   int theme = 1;  // colour theme index (theme.cpp): 1 = Midnight (default), 0 = Daylight
 };
 
@@ -40,6 +54,11 @@ void settingsSaveBrightness();
 void settingsSaveFavourite(int slot);
 void settingsSaveScriptName(int slot);
 void settingsSaveGrace();
-void settingsSavePanel();  // the caller restarts after
+void settingsSavePanel();  // panel state + pclk; the caller restarts after
+// The user chose a display variant (setup portal, /panel): starts a trial (or ends it when it is the confirmed one),
+// resets the pixel clock to the variant default and saves. The caller restarts after.
+void settingsSelectPanel(int variant);
+void settingsConfirmPanel();  // "Keep": the current variant becomes the confirmed one
 void settingsSaveTheme();      // applied live by the caller
+void settingsSaveHr();         // all the hr* fields
 void settingsSaveBluetooth();  // the caller restarts after

@@ -33,6 +33,7 @@ device to confirm it stopped).
 | Autopilot favourites | `vgpanel`: `fav0`, `fav1`, `fav2` | 8 peaks each, 1 byte per wave | empty (the Session tab shows `-`) | Saved with a long press on a favourite button; a tap loads it |
 | Script names | `vgpanel`: `sn0` to `sn29` | text | none | 30 slots; an empty name removes the key |
 | Follow and scale per device | `devices`: one entry per device (`ab` for the cloud device, the Bluetooth address without colons for a toy) | Follow on/off; scale 10 to 100 % (the UI offers 25, 50, 75, 100) | cloud device: on, 100 %; a toy: off until you Connect it (then on, 100 %) | Stored as a 2-byte blob |
+| HR edging | `vgpanel`: `hre` (bool, off), `hrrest` (40-150, 70), `hredge` (50-200, 120), `hrdrop` (3-60, 15), `hrcount` (0-50, 5; 0 = no limit), `hrstep` (0-10, 2), `hrrise` (0 or 8-60, 20) | Session tab, HR edging section | as shown | at once, also mid-session | Autopilot option, see the user guide |
 | Remembered Bluetooth toys | `bletoys`: one entry per toy (address, type) | | none | Remembered toys reconnect by themselves |
 
 ## Not saved
@@ -57,10 +58,12 @@ Set before building; not changeable on the panel. The file is ignored by git: co
 |---|---|
 | `WIFI_SSID`, `WIFI_PASS` | Default Wi-Fi. Leave `WIFI_SSID` empty to get the setup portal on first boot |
 | `DEVICE_TOKEN` | Default Autoblow device token |
-| `OTA_PASSWORD` | Password of the panel's web interface, which `ota.sh` uses (user `ota`). If empty, no login succeeds, so updates and the protected pages are unreachable |
+| `OTA_PASSWORD` | Dev builds only: a fixed password for the web interface (user `ota`) instead of the per-device random one. Leave it out: the panel then makes its own at first boot and shows it on the Settings tab ("Web login") |
 | `OTA_HOST` | Where `ota.sh` sends updates (host name or IP); default `twiddle-p4.local` |
 | `PANEL_HOSTNAME` (optional) | The panel's network name; default `twiddle-p4` (reachable as `twiddle-p4.local`) |
 | `AUTOBLOW_API_BASE` (optional) | Use another server than the Autoblow cloud (plain http allowed), for example an emulator for testing. Leave out for the real cloud |
+
+**Release build:** `idf.py -DTWIDDLE_RELEASE=ON build` ignores `secrets.h` completely and uses `main/secrets.release.h` (all empty); the panel is then set up through the `Twiddle-Setup` portal and keeps everything in NVS. Without a `secrets.h` file the same empty defaults apply. See [flashing.md](flashing.md).
 
 Values saved on the Settings tab win over `secrets.h`. The values from `secrets.h` are used only while nothing
 is stored in NVS for that key.
@@ -68,5 +71,5 @@ is stored in NVS for that key.
 ## Fixed in the firmware
 
 Not settings, but good to know: the Autopilot has eight waves; there are 30 script slots; the setup portal
-network is `Twiddle-Setup` (password `twiddle-setup`, address 192.168.4.1); a new firmware is confirmed after 30 s
+network is `Twiddle-Setup` (password `twiddle-setup`, page `http://192.168.4.1/setup`); a new firmware is confirmed after 30 s
 of Wi-Fi and rolled back after 3 minutes without ([ota-and-rollback.md](ota-and-rollback.md)).

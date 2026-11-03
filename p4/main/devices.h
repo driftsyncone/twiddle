@@ -15,7 +15,7 @@
 
 namespace devices {
 
-enum class Kind : uint8_t { Autoblow, Lovense, Kiiroo, Ossm };
+enum class Kind : uint8_t { Autoblow, Lovense, Kiiroo, Ossm, Hrm };  // Hrm: heart rate monitor, an input, not a toy
 
 // What a device can do, for the UI to show the right controls.
 enum Cap : uint8_t {
@@ -24,6 +24,7 @@ enum Cap : uint8_t {
   CAP_VIBRATE = 4,  // vibration motor(s)
   CAP_STROKE = 8,   // linear stroker (Keon): level = stroke speed
   CAP_AIR = 16,     // Lovense Max: air pump (follows the level)
+  CAP_HR = 32,      // heart rate monitor: reports bpm, takes no output (no CAP_SPEED)
 };
 
 struct Info {
@@ -39,6 +40,7 @@ struct Info {
   int battery;       // 0..100, -1 unknown
   int level;         // 0..100 it is running at now (0 = stopped)
   int rssi;          // Bluetooth signal, 0 unknown
+  int bpm;           // CAP_HR devices: last heart rate, 0 unknown or stale
   char status[48];   // one line for the UI: "Ready", "Connecting...", "Out of range", errors
 };
 

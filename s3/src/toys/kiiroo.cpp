@@ -2,7 +2,7 @@
 // strokes; the stroke speed follows the level.
 //
 // Protocol details from the Buttplug project, BSD-3-Clause, Copyright (c)
-// 2016-2026 Nonpolynomial Labs, LLC (see THIRD_PARTY_NOTICES.md):
+// 2016-2023 Nonpolynomial Labs, LLC (see THIRD_PARTY_NOTICES.md):
 //   crates/buttplug_server_device_config/device-config/protocols/
 //     kiiroo-v21-initialized.yml, kiiroo-v3.yml
 //   crates/buttplug_server/src/device/protocol_impl/kiiroo_v21_initialized.rs,

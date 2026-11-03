@@ -6,7 +6,7 @@
 // Our own client, written from the OSSM's documented BLE API (docs.ossm, BLE
 // Protocol page) and checked against the firmware's behaviour; no firmware code
 // is copied. The UUIDs and the name match Buttplug's device config, BSD-3-Clause,
-// Copyright (c) 2016-2026 Nonpolynomial Labs, LLC (see THIRD_PARTY_NOTICES.md):
+// Copyright (c) 2016-2023 Nonpolynomial Labs, LLC (see THIRD_PARTY_NOTICES.md):
 //   crates/buttplug_server_device_config/device-config/protocols/ossm.yml
 //
 // What the machine does, as far as this driver cares:

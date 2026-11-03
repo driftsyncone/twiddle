@@ -60,6 +60,22 @@ void autopilotSeek(uint32_t t);  // jump to t ms into the session
 void autopilotSetPeak(int wave, int peak);
 int autopilotPeak(int wave);
 void autopilotClearPeaks();
+// HR edging (edge.h): Autopilot driven by a BLE heart rate monitor. Off by default; off = the plain
+// Autopilot, untouched. In this mode the speed is the edge controller's, Length applies, and
+// More / graph seek do nothing; Back off drops to rest. A start always begins a fresh HR session.
+void autopilotSetHrEdging(bool on);
+bool autopilotHrEdging();
+void autopilotHrApply();       // settings.hr* changed: take them over (also mid-session)
+void autopilotHrLearnEdge();   // edge bpm := the current bpm (needs a fresh reading); saved
+struct HrStatus {
+  int phase;      // 0 climb, 1 hold-off (edge), 2 rest, 3 signal lost, 4 done, -1 not running
+  int edges, maxEdges;
+  int edgeBpm;    // the current trigger (it rises with every cycle)
+  int bpm;        // 0 = no reading
+  int end;        // why a finished session ended: 0 running/none, 1 edges, 2 length, 3 signal lost
+};
+HrStatus autopilotHrStatus();
+int autopilotHrBpmAt(uint32_t t);  // graph: recorded bpm at t ms into the session (0 none)
 void autopilotSaveFavourite(int slot);  // the current peaks
 bool autopilotLoadFavourite(int slot);  // false if the slot is empty
 int autopilotWaves();
@@ -70,6 +86,14 @@ void scriptToggle();        // pause / resume
 int scriptSlot();           // -1 if none
 bool scriptPlaying();
 
+// Physical encoder (encoder.h). Both run on the LVGL thread. Adjust: signed percent points on the ACTIVE speed (Remote: the
+// manual speed; Autopilot / HR edging: a live scale, 20..100 % of the planned speed, never above what the screen allows;
+// Script: ignored, a script has no speed here; paused: ignored). Returns true if it changed something.
+// TogglePause: pause the running mode, or resume what the encoder paused (ramping back up over ~1.5 s). A script just
+// pauses / resumes. After STOP, a loss or the low-battery stop there is nothing to resume.
+bool encoderAdjust(int pct);
+bool encoderTogglePause();
+bool encoderPaused();  // paused by the encoder and still resumable (for its light)
 // Everything off, valves closed, and resend it all.
 void stopAll();
 // stopAll(), then restart the panel once the device has stopped (5 s at most).

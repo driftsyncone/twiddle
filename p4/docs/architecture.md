@@ -53,7 +53,7 @@ sources and [history.md](history.md) are the reference for behaviour.
 | `bletoys` | one blob per remembered toy (address, type) | remembered toys auto-reconnect with 15/30/60/120 s backoff |
 
 ## Web server (port 80, `ota.cpp`)
-Basic auth user `ota`, password `OTA_PASSWORD`.
+Basic auth user `ota`, password per device (`otapw.cpp`, NVS `otapw`; `OTA_PASSWORD` only in a dev build).
 | Route | Auth | What |
 |---|---|---|
 | `GET /` | none | status text, one `key: value` per line: `twiddle <FW_VERSION>`, `built <date time>` (only changes when `ota.cpp` recompiles), `id:` (first 16 hex chars of the ELF SHA-256, different for every build), `board:`, `firmware:` (rollback state), `display fixes:` (always -1 on the P4), `reset:` (reason), `device:` (cloud online/offline + last error), `heap:` (internal free and largest block), the Wi-Fi report (`wifi: ... drops ... last reason`), `bluetooth: on/off`, `cloud: lost N x, silent N ms, grace N s, uptime N s` |
@@ -63,7 +63,7 @@ Basic auth user `ota`, password `OTA_PASSWORD`.
 | `GET /theme[?n=N[&save=1]]` | yes | list themes / switch live (`save=1` keeps it after a reboot) |
 | `POST /restart`, `/resync`, `/scan`; `GET /backlight?duty=N` | yes | diagnostics: restart (stops everything first), display resync (a no-op on the P4 DSI panel), 8 s Bluetooth scan, raw backlight PWM duty 0..255 (-1 = back to the brightness setting) |
 | `GET/POST /setup` | open while in portal mode, else yes | Wi-Fi/token setup page (POST body at most 1500 bytes); saving restarts the panel. In portal mode every unknown path redirects (302) to it; otherwise unknown paths answer 404 |
-Auth is checked in each handler by `login()` (basic auth user `ota`; with an empty `OTA_PASSWORD` every login fails). The server has `max_uri_handlers = 20` (11 registered), LRU purge on, 10 s send/receive timeouts.
+Auth is checked in each handler by `login()` (basic auth user `ota`, the per-device password from `otapw`; **403** while no password exists, 401 plus a 0.5 s pause on a wrong one; 5 wrong in a row = 429 for 60 s, `loginlimit.h`). `/setup` and `POST /display` skip it only while the setup portal is up. The server has `max_uri_handlers = 20` (15 registered), LRU purge on, 10 s send/receive timeouts.
 Portal mode (no SSID stored, i.e. `settings.wifiSsid` empty; a non-empty `WIFI_SSID` in `secrets.h` counts as stored): AP `Twiddle-Setup` / `twiddle-setup` (WPA2, channel 1, 4 clients), address 192.168.4.1, captive DNS, background scan. The mDNS name `twiddle-p4.local` can be changed with `#define PANEL_HOSTNAME` in `secrets.h`.
 
 ## Autoblow cloud API as used

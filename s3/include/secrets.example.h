@@ -7,4 +7,4 @@
 #define OTA_PASSWORD "pick-a-password"  // for ./ota.sh uploads over Wi-Fi
 #define OTA_HOST     "twiddle-s3.local"   // where ./ota.sh sends updates (hostname or IP)
 // #define OTA_HOST_WS  "twiddle-ws.local"  // same, for a Waveshare panel (env waveshare5-ota)
-// #define PANEL_HOSTNAME "my-panel"  // overrides the network name (defaults: Guition "twiddle-s3", Waveshare "twiddle-ws")
+// #define PANEL_HOSTNAME "twiddle-s3"  // Guition network name (the waveshare5 env sets "twiddle-ws" itself)

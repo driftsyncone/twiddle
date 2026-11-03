@@ -2,6 +2,8 @@
 # Upload firmware over Wi-Fi to the panel's /update endpoint (ESP32-P4 build).
 #   ./ota.sh [build/twiddle.bin] [host]
 #   ./ota.sh --check [host]     only verify the panel is reachable and runs this project (no upload)
+# Password (user "ota"): $OTA_PASSWORD, else OTA_PASSWORD in main/secrets.h (dev builds), else a prompt. A panel made
+# for the web flasher has a random one per device: Settings tab ("Web login") only.
 # Host: argument, else $PANEL_HOST, else OTA_HOST from main/secrets.h, else
 # twiddle-p4.local (this firmware's default mDNS name; PANEL_HOSTNAME in secrets.h changes it). The panel must be reachable from this machine.
 #
@@ -10,10 +12,11 @@
 set -e
 cd "$(dirname "$0")"
 bin=${1:-build/twiddle.bin}
-define() { sed -n "s/^#define $1 *\"\(.*\)\".*/\1/p" main/secrets.h; }
+define() { [ -f main/secrets.h ] && sed -n "s/^#define $1 *\"\(.*\)\".*/\1/p" main/secrets.h; true; }
 host=${2:-${PANEL_HOST:-$(define OTA_HOST)}}
 host=${host:-twiddle-p4.local}
-pass=$(define OTA_PASSWORD)
+pass=${OTA_PASSWORD:-}
+[ -n "$pass" ] || pass=$(define OTA_PASSWORD)
 built() { curl -fsS --max-time 5 "http://$host/" 2>/dev/null | sed -n 's/^id: //p'; }  # the firmware's own hash: changes with every build
 state() { curl -fsS --max-time 5 "http://$host/" 2>/dev/null | sed -n 's/^firmware: //p'; }
 
@@ -39,9 +42,16 @@ if [ "$board" != "$expect_board" ]; then
 fi
 if [ "$1" = "--check" ]; then echo "OK: $host runs $project on a $board"; exit 0; fi
 
+if [ -z "$pass" ]; then
+  [ -t 0 ] || { echo "No web password: set OTA_PASSWORD (shown on the panel's Settings tab, user ota) or run this in a terminal." >&2; exit 1; }
+  printf 'Web password for %s (Settings tab, "Web login"): ' "$host" >&2
+  stty -echo 2>/dev/null; IFS= read -r pass; stty echo 2>/dev/null; echo >&2
+fi
 before=$(built || true)
 echo "Uploading $bin to $host ..."
-curl -fsS --max-time 120 -u "ota:$pass" -F "firmware=@$bin" "http://$host/update"
+# the password goes through a config on stdin, not onto the command line (where ps would show it)
+printf 'user = "ota:%s"\n' "$pass" | curl -fsS --max-time 120 -K - -F "firmware=@$bin" "http://$host/update" \
+  || { echo "Upload refused. 401 = wrong password, 403 = the panel has no web password yet (see its Settings tab)." >&2; exit 1; }
 
 echo "Waiting for the new firmware to confirm itself (up to 4 min) ..."
 sleep 10
